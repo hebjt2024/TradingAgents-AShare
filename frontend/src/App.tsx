@@ -1,12 +1,16 @@
 import { BrowserRouter, Navigate, Routes, Route } from 'react-router-dom'
 import { useEffect } from 'react'
+import { SpeedInsights } from '@vercel/speed-insights/react'
 import Layout from './components/Layout'
 import Dashboard from './pages/Dashboard'
 import Analysis from './pages/Analysis'
 import Reports from './pages/Reports'
 import Settings from './pages/Settings'
 import Portfolio from './pages/Portfolio'
+import TrackingBoard from './pages/TrackingBoard'
 import Login from './pages/Login'
+import Sponsor from './pages/Sponsor'
+import Thanks from './pages/Thanks'
 import { useAuthStore } from './stores/authStore'
 
 function RequireAuth({ children }: { children: JSX.Element }) {
@@ -32,6 +36,8 @@ function App() {
     <BrowserRouter>
       <Routes>
         <Route path="/login" element={<Login />} />
+        <Route path="/sponsor" element={<Sponsor />} />
+        <Route path="/thanks" element={<Thanks />} />
         <Route
           path="*"
           element={
@@ -39,6 +45,7 @@ function App() {
               <Layout>
                 <Routes>
                   <Route path="/" element={<Dashboard />} />
+                  <Route path="/tracking-board" element={<TrackingBoard />} />
                   <Route path="/analysis" element={<Analysis />} />
                   <Route path="/reports" element={<Reports />} />
                   <Route path="/portfolio" element={<Portfolio />} />
@@ -49,6 +56,7 @@ function App() {
           }
         />
       </Routes>
+      <SpeedInsights />
     </BrowserRouter>
   )
 }

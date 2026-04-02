@@ -1,8 +1,8 @@
 import { useState, useEffect, useMemo } from 'react'
-import { Save, Key, Database, Loader2, MessageSquare, User, Trash2, Link2, Copy, Plus, CheckCircle2 } from 'lucide-react'
+import { Save, Key, Database, Loader2, Trash2, Link2, Copy, Plus, CheckCircle2, Mail, Flame, Webhook } from 'lucide-react'
 import { api } from '@/services/api'
 import { useAuthStore } from '@/stores/authStore'
-import type { UserToken } from '@/types'
+import type { RuntimeWarmupResult, UserToken } from '@/types'
 
 type ProviderPreset = {
     id: string
@@ -40,10 +40,13 @@ function inferPreset(llmProvider: string, backendUrl: string): string {
 
 export default function Settings() {
     const { user } = useAuthStore()
-    const [defaultAnalysts, setDefaultAnalysts] = useState(['market', 'social', 'news', 'fundamentals', 'macro', 'smart_money'])
+    const [defaultAnalysts, setDefaultAnalysts] = useState(['market', 'social', 'news', 'fundamentals', 'macro', 'smart_money', 'volume_price'])
     const [customPrompt, setCustomPrompt] = useState('')
     const [llmApiKey, setLlmApiKey] = useState('')
     const [hasStoredApiKey, setHasStoredApiKey] = useState(false)
+    const [wecomWebhook, setWecomWebhook] = useState('')
+    const [hasStoredWebhook, setHasStoredWebhook] = useState(false)
+    const [storedWebhookDisplay, setStoredWebhookDisplay] = useState('')
 
     const [providerPreset, setProviderPreset] = useState('openai')
     const [customBaseUrl, setCustomBaseUrl] = useState('')
@@ -52,11 +55,20 @@ export default function Settings() {
     const [maxDebateRounds, setMaxDebateRounds] = useState(1)
     const [maxRiskRounds, setMaxRiskRounds] = useState(1)
     const [serverFallbackEnabled, setServerFallbackEnabled] = useState(true)
-
+    const [emailReportEnabled, setEmailReportEnabled] = useState(true)
+    const [wecomReportEnabled, setWecomReportEnabled] = useState(true)
     const [configLoading, setConfigLoading] = useState(false)
     const [saving, setSaving] = useState(false)
+    const [saveAllSaving, setSaveAllSaving] = useState(false)
+    const [warmingUp, setWarmingUp] = useState(false)
     const [saved, setSaved] = useState(false)
+    const [saveMessage, setSaveMessage] = useState('设置已保存')
     const [configError, setConfigError] = useState<string | null>(null)
+    const [warmupResults, setWarmupResults] = useState<RuntimeWarmupResult[]>([])
+    const [warmupError, setWarmupError] = useState<string | null>(null)
+    const [wecomWarmingUp, setWecomWarmingUp] = useState(false)
+    const [wecomWarmupMessage, setWecomWarmupMessage] = useState<string | null>(null)
+    const [wecomWarmupError, setWecomWarmupError] = useState<string | null>(null)
 
     // API Token states
     const [tokens, setTokens] = useState<UserToken[]>([])
@@ -73,6 +85,15 @@ export default function Settings() {
 
     const effectiveProvider = selectedPreset.provider
     const effectiveBaseUrl = selectedPreset.editableBaseUrl ? customBaseUrl.trim() : selectedPreset.baseUrl
+    useEffect(() => {
+        setWarmupResults([])
+        setWarmupError(null)
+    }, [providerPreset, customBaseUrl, deepThinkLlm, quickThinkLlm, llmApiKey])
+
+    useEffect(() => {
+        setWecomWarmupMessage(null)
+        setWecomWarmupError(null)
+    }, [wecomWebhook])
 
     useEffect(() => {
         try {
@@ -103,7 +124,11 @@ export default function Settings() {
                 setMaxDebateRounds(cfg.max_debate_rounds)
                 setMaxRiskRounds(cfg.max_risk_discuss_rounds)
                 setHasStoredApiKey(!!cfg.has_api_key)
+                setHasStoredWebhook(!!cfg.has_wecom_webhook)
+                setStoredWebhookDisplay(cfg.wecom_webhook_display || '')
                 setServerFallbackEnabled(!!cfg.server_fallback_enabled)
+                setEmailReportEnabled(cfg.email_report_enabled !== false)
+                setWecomReportEnabled(cfg.wecom_report_enabled !== false)
             })
             .catch(err => {
                 setConfigError(err instanceof Error ? err.message : '无法连接到后端')
@@ -158,34 +183,81 @@ export default function Settings() {
         setTimeout(() => setCopiedTokenId(null), 2000)
     }
 
-    const handleSave = async () => {
-        setSaving(true)
+    const persistLocalSettings = () => {
         localStorage.setItem('tradingagents-settings', JSON.stringify({
             defaultAnalysts,
             customPrompt,
         }))
         localStorage.setItem('ta-custom-prompt', customPrompt)
+    }
+
+    const buildRuntimeConfigPayload = (options?: { includeEmail?: boolean; includeWecom?: boolean }) => ({
+        llm_provider: effectiveProvider,
+        backend_url: effectiveBaseUrl || undefined,
+        deep_think_llm: deepThinkLlm,
+        quick_think_llm: quickThinkLlm,
+        max_debate_rounds: maxDebateRounds,
+        max_risk_discuss_rounds: maxRiskRounds,
+        api_key: llmApiKey || undefined,
+        ...(options?.includeWecom ? {
+            wecom_webhook_url: wecomWebhook.trim() || undefined,
+            wecom_report_enabled: wecomReportEnabled,
+        } : {}),
+        ...(options?.includeEmail ? { email_report_enabled: emailReportEnabled } : {}),
+    })
+
+    const showSavedMessage = (message: string) => {
+        setSaveMessage(message)
+        setSaved(true)
+        setTimeout(() => setSaved(false), 2000)
+    }
+
+    const submitConfig = async (options?: { forceWarmup?: boolean; successMessage?: string; includeEmail?: boolean; includeWecom?: boolean }) => {
+        persistLocalSettings()
+        const { forceWarmup = false, successMessage = '设置已保存', includeEmail = true, includeWecom = false } = options || {}
+        const response = await api.updateConfig({
+            ...buildRuntimeConfigPayload({ includeEmail, includeWecom }),
+            warmup: true,
+            force_warmup: forceWarmup,
+        })
+        setHasStoredApiKey(!!response.has_api_key)
+        setHasStoredWebhook(!!response.current.has_wecom_webhook)
+        setStoredWebhookDisplay(response.current.wecom_webhook_display || '')
+        setWecomReportEnabled(response.current.wecom_report_enabled !== false)
+        setLlmApiKey('')
+        setWecomWebhook('')
+        showSavedMessage(response.warmup?.message || successMessage)
+        return response
+    }
+
+    const handleSaveAll = async () => {
+        setSaveAllSaving(true)
         try {
-            const response = await api.updateConfig({
-                llm_provider: effectiveProvider,
-                backend_url: effectiveBaseUrl || undefined,
-                deep_think_llm: deepThinkLlm,
-                quick_think_llm: quickThinkLlm,
-                max_debate_rounds: maxDebateRounds,
-                max_risk_discuss_rounds: maxRiskRounds,
-                api_key: llmApiKey || undefined,
-            })
-            setHasStoredApiKey(!!response.has_api_key)
-            setLlmApiKey('')
-            setSaved(true)
-            setTimeout(() => setSaved(false), 2000)
+            await submitConfig({ includeEmail: true, includeWecom: true, successMessage: '全部设置已保存' })
+            showSavedMessage('全部设置已保存')
         } catch (err) {
-            alert(err instanceof Error ? err.message : '保存配置失败')
+            alert(err instanceof Error ? err.message : '保存全部设置失败')
         } finally {
-            setSaving(false)
+            setSaveAllSaving(false)
         }
     }
 
+    const handleWarmup = async () => {
+        setWarmingUp(true)
+        setWarmupError(null)
+        setWarmupResults([])
+        try {
+            const response = await api.warmupConfig({
+                ...buildRuntimeConfigPayload(),
+                prompt: '你好',
+            })
+            setWarmupResults(response.results || [])
+        } catch (err) {
+            setWarmupError(err instanceof Error ? err.message : 'Warmup 触发失败')
+        } finally {
+            setWarmingUp(false)
+        }
+    }
     const handleClearApiKey = async () => {
         if (!hasStoredApiKey) return
         setSaving(true)
@@ -202,6 +274,44 @@ export default function Settings() {
         }
     }
 
+    const handleClearWebhook = async () => {
+        if (!hasStoredWebhook) return
+        setSaving(true)
+        try {
+            const response = await api.updateConfig({ clear_wecom_webhook: true })
+            setHasStoredWebhook(!!response.current.has_wecom_webhook)
+            setStoredWebhookDisplay(response.current.wecom_webhook_display || '')
+            setWecomWebhook('')
+            setWecomWarmupMessage(null)
+            setWecomWarmupError(null)
+            showSavedMessage('企业微信机器人已清除')
+        } catch (err) {
+            alert(err instanceof Error ? err.message : '清除企业微信机器人失败')
+        } finally {
+            setSaving(false)
+        }
+    }
+
+    const handleWecomWarmup = async () => {
+        setWecomWarmingUp(true)
+        setWecomWarmupMessage(null)
+        setWecomWarmupError(null)
+        try {
+            const response = await api.warmupWecom({
+                wecom_webhook_url: wecomWebhook.trim() || undefined,
+            })
+            setWecomWarmupMessage(
+                response.webhook_display
+                    ? `${response.message}，目标：${response.webhook_display}`
+                    : response.message
+            )
+        } catch (err) {
+            setWecomWarmupError(err instanceof Error ? err.message : 'Webhook 测试发送失败')
+        } finally {
+            setWecomWarmingUp(false)
+        }
+    }
+
     const toggleAnalyst = (analyst: string) => {
         setDefaultAnalysts(prev =>
             prev.includes(analyst) ? prev.filter(a => a !== analyst) : [...prev, analyst]
@@ -212,25 +322,14 @@ export default function Settings() {
         <div className="space-y-6">
             <div>
                 <h1 className="text-2xl font-bold text-slate-900 dark:text-slate-100">系统设置</h1>
-                <p className="text-slate-500 dark:text-slate-400 mt-1">配置当前账户的分析参数与私有模型</p>
-            </div>
-
-            <div className="card space-y-3">
-                <div className="flex items-center gap-2">
-                    <User className="w-5 h-5 text-cyan-500" />
-                    <h2 className="text-lg font-semibold text-slate-900 dark:text-slate-100">账户空间</h2>
-                </div>
-                <div className="text-sm text-slate-600 dark:text-slate-300">
-                    <div>当前登录：{user?.email || '-'}</div>
-                    <div className="mt-1 text-slate-500 dark:text-slate-400">报告历史、分析任务和模型配置仅当前账户可见。</div>
-                </div>
+                <p className="text-slate-500 dark:text-slate-400 mt-1">配置当前账户的分析参数与模型</p>
             </div>
 
             <div className="card space-y-4">
                 <div className="flex items-center gap-2">
                     <Database className="w-5 h-5 text-purple-500" />
                     <h2 className="text-lg font-semibold text-slate-900 dark:text-slate-100">模型接入</h2>
-                    {configLoading && <Loader2 className="w-4 h-4 animate-spin text-slate-400 ml-auto" />}
+                    {configLoading && <Loader2 className="ml-auto w-4 h-4 animate-spin text-slate-400" />}
                 </div>
 
                 {configError && (
@@ -340,7 +439,7 @@ export default function Settings() {
                                 <button
                                     type="button"
                                     onClick={handleClearApiKey}
-                                    disabled={saving}
+                                    disabled={saving || saveAllSaving}
                                     className="inline-flex items-center gap-1 text-xs text-rose-500 hover:text-rose-600 disabled:opacity-50"
                                 >
                                     <Trash2 className="w-3.5 h-3.5" />
@@ -348,36 +447,54 @@ export default function Settings() {
                                 </button>
                             )}
                         </div>
+                        <p className="mt-2 text-xs text-slate-500 dark:text-slate-400">
+                            保存模型配置后，系统会在后台自动测试连通性；也可以直接点击下方按钮，发送\u201c你好\u201d来验证模型是否正常响应。
+                        </p>
                     </div>
 
-                    <div>
-                        <label className="block text-sm font-medium text-slate-600 dark:text-slate-400 mb-2">
-                            辩论轮数上限
-                        </label>
-                        <input
-                            type="number"
-                            min={1}
-                            max={5}
-                            value={maxDebateRounds}
-                            onChange={e => setMaxDebateRounds(Number(e.target.value))}
-                            className="input w-full"
-                            disabled={configLoading}
-                        />
-                    </div>
+                    <div className="md:col-span-2 rounded-2xl border border-slate-200/80 dark:border-slate-700/80 bg-slate-50/80 dark:bg-slate-900/40 p-4 space-y-3">
+                        <div className="flex flex-wrap items-center justify-between gap-3">
+                            <div>
+                                <div className="text-sm font-medium text-slate-900 dark:text-slate-100">连通性测试</div>
+                                <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
+                                    使用当前表单配置向模型发送“你好”，不会自动保存设置。
+                                </p>
+                            </div>
+                            <button onClick={handleWarmup} disabled={saving || saveAllSaving || warmingUp || configLoading} className="btn-secondary inline-flex items-center gap-2">
+                                {warmingUp ? <Loader2 className="w-4 h-4 animate-spin" /> : <Flame className="w-4 h-4" />}
+                                {warmingUp ? '测试中...' : '测试连接'}
+                            </button>
+                        </div>
 
-                    <div>
-                        <label className="block text-sm font-medium text-slate-600 dark:text-slate-400 mb-2">
-                            风险讨论轮数上限
-                        </label>
-                        <input
-                            type="number"
-                            min={1}
-                            max={5}
-                            value={maxRiskRounds}
-                            onChange={e => setMaxRiskRounds(Number(e.target.value))}
-                            className="input w-full"
-                            disabled={configLoading}
-                        />
+                        {warmupError && (
+                            <div className="rounded-xl border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-600 dark:border-rose-900/60 dark:bg-rose-950/30 dark:text-rose-300">
+                                {warmupError}
+                            </div>
+                        )}
+
+                        {warmupResults.length > 0 && (
+                            <div className="space-y-3">
+                                {warmupResults.map((item, index) => (
+                                    <div
+                                        key={`${item.model}-${index}`}
+                                        className="rounded-xl border border-slate-200/80 dark:border-slate-700/80 bg-white dark:bg-slate-950/40 px-4 py-3"
+                                    >
+                                        <div className="flex flex-wrap items-center gap-2 text-xs text-slate-500 dark:text-slate-400">
+                                            <span className="font-medium text-slate-700 dark:text-slate-200">{item.targets.join(' / ')}</span>
+                                            <span>{item.model}</span>
+                                        </div>
+                                        {item.content && (
+                                            <pre className="mt-2 whitespace-pre-wrap break-words font-sans text-sm text-slate-700 dark:text-slate-200">
+                                                {item.content}
+                                            </pre>
+                                        )}
+                                        {item.error && (
+                                            <p className="mt-2 text-sm text-rose-500 dark:text-rose-300">{item.error}</p>
+                                        )}
+                                    </div>
+                                ))}
+                            </div>
+                        )}
                     </div>
                 </div>
             </div>
@@ -400,6 +517,7 @@ export default function Settings() {
                             { key: 'fundamentals', label: '基本面' },
                             { key: 'macro', label: '宏观板块' },
                             { key: 'smart_money', label: '主力资金' },
+                            { key: 'volume_price', label: '量价分析' },
                         ].map((analyst) => {
                             const active = defaultAnalysts.includes(analyst.key)
                             return (
@@ -418,6 +536,49 @@ export default function Settings() {
                             )
                         })}
                     </div>
+                </div>
+
+                <div className="grid grid-cols-2 gap-4">
+                    <div>
+                        <label className="block text-sm font-medium text-slate-600 dark:text-slate-400 mb-2">
+                            辩论轮数上限
+                        </label>
+                        <input
+                            type="number"
+                            min={1}
+                            max={5}
+                            value={maxDebateRounds}
+                            onChange={e => setMaxDebateRounds(Number(e.target.value))}
+                            className="input w-full"
+                            disabled={configLoading}
+                        />
+                    </div>
+                    <div>
+                        <label className="block text-sm font-medium text-slate-600 dark:text-slate-400 mb-2">
+                            风险讨论轮数上限
+                        </label>
+                        <input
+                            type="number"
+                            min={1}
+                            max={5}
+                            value={maxRiskRounds}
+                            onChange={e => setMaxRiskRounds(Number(e.target.value))}
+                            className="input w-full"
+                            disabled={configLoading}
+                        />
+                    </div>
+                </div>
+
+                <div>
+                    <label className="block text-sm font-medium text-slate-600 dark:text-slate-400 mb-2">
+                        自定义分析提示
+                    </label>
+                    <textarea
+                        value={customPrompt}
+                        onChange={e => setCustomPrompt(e.target.value)}
+                        className="input w-full min-h-[80px] resize-y"
+                        placeholder="例如：更关注估值安全边际、政策催化与机构资金行为。"
+                    />
                 </div>
             </div>
 
@@ -511,28 +672,105 @@ export default function Settings() {
 
             <div className="card space-y-4">
                 <div className="flex items-center gap-2">
-                    <MessageSquare className="w-5 h-5 text-cyan-500" />
-                    <h2 className="text-lg font-semibold text-slate-900 dark:text-slate-100">自定义分析提示</h2>
+                    <Mail className="w-5 h-5 text-blue-500" />
+                    <h2 className="text-lg font-semibold text-slate-900 dark:text-slate-100">报告推送</h2>
                 </div>
-                <div>
-                    <label className="block text-sm font-medium text-slate-600 dark:text-slate-400 mb-2">
-                        附加提示词
-                    </label>
-                    <textarea
-                        value={customPrompt}
-                        onChange={e => setCustomPrompt(e.target.value)}
-                        className="input w-full min-h-[120px] resize-y"
-                        placeholder="例如：更关注估值安全边际、政策催化与机构资金行为。"
-                    />
+
+                {/* 邮件推送 */}
+                <div className="rounded-xl border border-slate-200/80 bg-slate-50/80 px-4 py-3 dark:border-slate-700/80 dark:bg-slate-900/40">
+                    <div className="flex items-center justify-between">
+                        <div>
+                            <div className="text-sm font-medium text-slate-700 dark:text-slate-200">邮件推送</div>
+                            <div className="text-xs text-slate-400 dark:text-slate-500 mt-0.5">定时分析完成时发送至 {user?.email || '-'}</div>
+                        </div>
+                        <button
+                            type="button"
+                            onClick={() => setEmailReportEnabled(!emailReportEnabled)}
+                            disabled={configLoading}
+                            className={`relative inline-flex h-6 w-11 shrink-0 items-center rounded-full transition-colors ${
+                                emailReportEnabled ? 'bg-blue-500' : 'bg-slate-300 dark:bg-slate-600'
+                            }`}
+                        >
+                            <span className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${emailReportEnabled ? 'translate-x-6' : 'translate-x-1'}`} />
+                        </button>
+                    </div>
+                </div>
+
+                {/* 企业微信 Webhook */}
+                <div className="rounded-xl border border-slate-200/80 bg-slate-50/80 px-4 py-3 space-y-3 dark:border-slate-700/80 dark:bg-slate-900/40">
+                    <div className="flex items-center justify-between">
+                        <div>
+                            <div className="text-sm font-medium text-slate-700 dark:text-slate-200">企业微信 Webhook</div>
+                            <div className="text-xs text-slate-400 dark:text-slate-500 mt-0.5">
+                                定时分析完成时向机器人推送摘要
+                                {storedWebhookDisplay && <span className="ml-2 font-mono">({storedWebhookDisplay})</span>}
+                            </div>
+                        </div>
+                        <button
+                            type="button"
+                            onClick={() => setWecomReportEnabled(!wecomReportEnabled)}
+                            disabled={configLoading}
+                            className={`relative inline-flex h-6 w-11 shrink-0 items-center rounded-full transition-colors ${
+                                wecomReportEnabled ? 'bg-blue-500' : 'bg-slate-300 dark:bg-slate-600'
+                            }`}
+                        >
+                            <span className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${wecomReportEnabled ? 'translate-x-6' : 'translate-x-1'}`} />
+                        </button>
+                    </div>
+
+                    <div className="flex items-center gap-2">
+                        <div className="relative flex-1">
+                            <Webhook className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
+                            <input
+                                type="text"
+                                value={wecomWebhook}
+                                onChange={e => setWecomWebhook(e.target.value)}
+                                className="input w-full pl-10"
+                                placeholder={hasStoredWebhook ? '已保存，留空则保持不变' : 'Webhook 地址'}
+                                disabled={configLoading}
+                            />
+                        </div>
+                        <button
+                            type="button"
+                            onClick={handleWecomWarmup}
+                            disabled={configLoading || saving || saveAllSaving || wecomWarmingUp || (!wecomWebhook.trim() && !hasStoredWebhook)}
+                            className="btn-secondary inline-flex items-center gap-1.5 text-xs shrink-0"
+                        >
+                            {wecomWarmingUp ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Flame className="w-3.5 h-3.5" />}
+                            {wecomWarmingUp ? '发送中...' : '测试连接'}
+                        </button>
+                        {hasStoredWebhook && (
+                            <button
+                                type="button"
+                                onClick={handleClearWebhook}
+                                disabled={saving || saveAllSaving}
+                                className="inline-flex items-center gap-1 text-xs text-slate-400 hover:text-rose-500 disabled:opacity-50 shrink-0"
+                            >
+                                <Trash2 className="w-3 h-3" />
+                                清除
+                            </button>
+                        )}
+                    </div>
+
+                    {wecomWarmupMessage && (
+                        <div className="rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs text-emerald-700 dark:border-emerald-900/60 dark:bg-emerald-950/30 dark:text-emerald-300">
+                            {wecomWarmupMessage}
+                        </div>
+                    )}
+                    {wecomWarmupError && (
+                        <div className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-600 dark:border-rose-900/60 dark:bg-rose-950/30 dark:text-rose-300">
+                            {wecomWarmupError}
+                        </div>
+                    )}
                 </div>
             </div>
 
             <div className="flex items-center gap-4">
-                <button onClick={handleSave} disabled={saving} className="btn-primary inline-flex items-center gap-2">
-                    {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
-                    保存设置
+                <button onClick={handleSaveAll} disabled={saveAllSaving} className="btn-primary inline-flex items-center gap-2">
+                    {saveAllSaving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
+                    保存全部
                 </button>
-                {saved && <span className="text-sm text-green-600 dark:text-green-400">✓ 设置已保存</span>}
+                {saved && <span className="text-sm text-green-600 dark:text-green-400">✓ {saveMessage}</span>}
             </div>
         </div>
     )

@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import AgentCollaboration from '@/components/AgentCollaboration'
+import DebateDrawer from '@/components/DebateDrawer'
 import ReportViewer from '@/components/ReportViewer'
 import ChatCopilotPanel from '@/components/ChatCopilotPanel'
 import KlinePanel from '@/components/KlinePanel'
@@ -48,6 +49,7 @@ export default function Analysis() {
     const querySymbol = (searchParams.get('symbol') || '').trim().toUpperCase()
     const [activeSymbol, setActiveSymbol] = useState(() => querySymbol || useAnalysisStore.getState().currentSymbol || '000001.SH')
     const [activeSection, setActiveSection] = useState<string | undefined>()
+    const [debateDrawer, setDebateDrawer] = useState<'research' | 'risk' | null>(null)
     const reportRef = useRef<HTMLDivElement | null>(null)
     const {
         report,
@@ -78,57 +80,60 @@ export default function Analysis() {
     }, [currentSymbol])
 
     const finalDecision = report?.final_trade_decision
-    // Prefer LLM-extracted structured values, fall back to regex parsing
     const confidence = jobConfidence ?? extractConfidence(finalDecision)
     const targetPrice = jobTargetPrice ?? extractPrice(finalDecision, 'target')
     const stopLoss = jobStopLoss ?? extractPrice(finalDecision, 'stop')
 
     return (
-        <div className="grid grid-cols-[340px_minmax(0,1fr)] gap-4 min-h-[calc(100vh-5rem)]">
-            <aside className="h-[calc(100vh-5rem)] sticky top-0 flex flex-col gap-4">
-                <div className="min-h-0 flex-1">
-                    <ChatCopilotPanel
-                        onSymbolDetected={(symbol) => {
-                            setActiveSymbol(symbol)
-                            setCurrentSymbol(symbol)
-                        }}
-                        onShowReport={handleShowReport}
-                        initialInput={initialChatInput}
-                    />
-                </div>
-            </aside>
+        <div className="space-y-4">
+            <div className="grid grid-cols-[340px_minmax(0,1fr)] gap-4 min-h-[calc(100vh-5rem)]">
+                <aside className="h-[calc(100vh-5rem)] sticky top-0 flex flex-col gap-4">
+                    <div className="min-h-0 flex-1">
+                        <ChatCopilotPanel
+                            onSymbolDetected={(symbol) => {
+                                setActiveSymbol(symbol)
+                                setCurrentSymbol(symbol)
+                            }}
+                            onShowReport={handleShowReport}
+                            initialInput={initialChatInput}
+                        />
+                    </div>
+                </aside>
 
-            <div className="min-w-0 space-y-4">
-                <div className="h-[360px]">
-                    <KlinePanel
-                        symbol={activeSymbol}
-                        onSymbolChange={(symbol) => {
-                            setActiveSymbol(symbol)
-                        }}
-                    />
-                </div>
+                <div className="min-w-0 space-y-4">
+                    <div className="h-[360px]">
+                        <KlinePanel
+                            symbol={activeSymbol}
+                            onSymbolChange={(symbol) => {
+                                setActiveSymbol(symbol)
+                            }}
+                        />
+                    </div>
 
-                <AgentCollaboration onSelectSection={handleShowReport} selectedSection={activeSection} />
+                    <AgentCollaboration onSelectSection={handleShowReport} onOpenDebate={setDebateDrawer} selectedSection={activeSection} />
 
-                <div className="grid grid-cols-1 xl:grid-cols-3 gap-4">
-                    <DecisionCard
-                        symbol={activeSymbol}
-                        report={report || undefined}
-                        decision={mapDecision(report?.decision)}
-                        direction={report?.direction}
-                        confidence={confidence}
-                        targetPrice={targetPrice}
-                        stopLoss={stopLoss}
-                        reasoning={finalDecision?.slice(0, 300)}
-                    />
-                    <RiskRadar items={riskItems} />
-                    <KeyMetrics items={keyMetrics} />
-                </div>
+                    <div className="grid grid-cols-1 xl:grid-cols-3 gap-4">
+                        <DecisionCard
+                            symbol={activeSymbol}
+                            report={report || undefined}
+                            decision={mapDecision(report?.decision)}
+                            direction={report?.direction}
+                            confidence={confidence}
+                            targetPrice={targetPrice}
+                            stopLoss={stopLoss}
+                            reasoning={finalDecision?.slice(0, 300)}
+                        />
+                        <RiskRadar items={riskItems} />
+                        <KeyMetrics items={keyMetrics} />
+                    </div>
 
-                <div ref={reportRef}>
-                    <ReportViewer activeSection={activeSection} />
+                    <div ref={reportRef}>
+                        <ReportViewer activeSection={activeSection} />
+                    </div>
                 </div>
             </div>
+
+            <DebateDrawer debate={debateDrawer} onClose={() => setDebateDrawer(null)} />
         </div>
     )
 }

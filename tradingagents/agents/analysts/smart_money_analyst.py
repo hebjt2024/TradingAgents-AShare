@@ -4,19 +4,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from tradingagents.dataflows.config import get_config
 from tradingagents.prompts import get_prompt
 from tradingagents.graph.intent_parser import build_horizon_context
-from tradingagents.agents.utils.agent_states import current_tracker_var
-
-
-def _extract_verdict(text):
-    import re, json
-    m = re.search(r'<!--\s*VERDICT:\s*(\{.*?\})\s*-->', text, re.DOTALL)
-    if m:
-        try:
-            d = json.loads(m.group(1))
-            return d.get("direction", "中性"), "中"
-        except Exception:
-            pass
-    return "中性", "低"
+from tradingagents.agents.utils.agent_states import current_tracker_var, extract_verdict
 
 
 def create_smart_money_analyst(llm, data_collector=None):
@@ -30,7 +18,7 @@ def create_smart_money_analyst(llm, data_collector=None):
         current_date = state["trade_date"]
         ticker = state["company_of_interest"]
         print(f"[Smart Money Analyst] START {ticker} {current_date}")
-        horizon = state.get("horizon", "short")
+        horizon = "short"  # 资金面固定短期视角
         user_intent = state.get("user_intent") or {}
         focus_areas = user_intent.get("focus_areas", [])
         specific_questions = user_intent.get("specific_questions", [])
@@ -63,10 +51,11 @@ def create_smart_money_analyst(llm, data_collector=None):
 
         messages = [
             SystemMessage(content=(
-                horizon_ctx + system_message
+                system_message
                 + "\n\n请严格基于提供的量化数据输出分析，全程使用中文。"
             )),
             HumanMessage(content=(
+                horizon_ctx + "\n"
                 f"请分析 {ticker} 在 {current_date} 的主力资金行为。\n\n"
                 f"【近5日主力资金净流向】\n{fund_flow}\n\n"
                 f"【龙虎榜数据】\n{lhb}\n\n"
@@ -84,7 +73,7 @@ def create_smart_money_analyst(llm, data_collector=None):
                 tracker._emit_token("Smart Money Analyst", "smart_money_report", content)
 
         print(f"[Smart Money Analyst] DONE {ticker}, report length={len(full_content)}")
-        verdict, confidence = _extract_verdict(full_content)
+        verdict, confidence = extract_verdict(full_content)
         return {
             "smart_money_report": full_content,
             "analyst_traces": [{

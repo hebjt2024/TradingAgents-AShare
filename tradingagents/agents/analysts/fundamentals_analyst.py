@@ -4,19 +4,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from tradingagents.dataflows.config import get_config
 from tradingagents.prompts import get_prompt
 from tradingagents.graph.intent_parser import build_horizon_context
-from tradingagents.agents.utils.agent_states import current_tracker_var
-
-
-def _extract_verdict(text):
-    import re, json
-    m = re.search(r'<!--\s*VERDICT:\s*(\{.*?\})\s*-->', text, re.DOTALL)
-    if m:
-        try:
-            d = json.loads(m.group(1))
-            return d.get("direction", "中性"), "中"
-        except Exception:
-            pass
-    return "中性", "低"
+from tradingagents.agents.utils.agent_states import current_tracker_var, extract_verdict
 
 
 def create_fundamentals_analyst(llm, data_collector=None):
@@ -29,7 +17,7 @@ def create_fundamentals_analyst(llm, data_collector=None):
     async def fundamentals_analyst_node(state):
         current_date = state["trade_date"]
         ticker = state["company_of_interest"]
-        horizon = state.get("horizon", "medium")
+        horizon = "medium"  # 基本面固定中长期视角
         user_intent = state.get("user_intent") or {}
         focus_areas = user_intent.get("focus_areas", [])
         specific_questions = user_intent.get("specific_questions", [])
@@ -58,8 +46,9 @@ def create_fundamentals_analyst(llm, data_collector=None):
             outputs = dict(zip(keys, results))
 
         messages = [
-            SystemMessage(content=horizon_ctx + system_message + "\n\n请全程使用中文。"),
+            SystemMessage(content=system_message + "\n\n请全程使用中文。"),
             HumanMessage(content=(
+                horizon_ctx + "\n"
                 f"以下是 {ticker} 在 {current_date} 的基本面资料。\n\n"
                 f"【get_fundamentals】\n{outputs['fundamentals']}\n\n"
                 f"【get_balance_sheet】\n{outputs['balance_sheet']}\n\n"
@@ -77,7 +66,7 @@ def create_fundamentals_analyst(llm, data_collector=None):
             if tracker:
                 tracker._emit_token("Fundamentals Analyst", "fundamentals_report", content)
 
-        verdict, confidence = _extract_verdict(full_content)
+        verdict, confidence = extract_verdict(full_content)
         return {
             "fundamentals_report": full_content,
             "analyst_traces": [{

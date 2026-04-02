@@ -13,7 +13,7 @@ from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from threading import Lock
 from fastapi import Body
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional, Tuple
 from uuid import uuid4
 
 import logging
@@ -31,7 +31,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from fastapi import FastAPI, HTTPException, Depends, Query, Request, status, BackgroundTasks
+from fastapi import FastAPI, File, HTTPException, Depends, Query, Request, UploadFile, status, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -39,8 +39,8 @@ from pydantic import BaseModel, Field, field_serializer
 from sqlalchemy.orm import Session
 import pandas as pd
 
-from api.database import UserDB, UserLLMConfigDB, ScheduledAnalysisDB, VersionStatsDB, init_db, get_db, SessionLocal
-from api.services import auth_service, report_service, token_service, watchlist_service, scheduled_service
+from api.database import UserDB, UserLLMConfigDB, ScheduledAnalysisDB, VersionStatsDB, ReportDB, ImportedPortfolioPositionDB, init_db, get_db, get_db_ctx
+from api.services import auth_service, portfolio_import_service, report_service, token_service, watchlist_service, scheduled_service, tracking_board_service
 
 def _get_real_ip(request: Request) -> Optional[str]:
     """Extract real client IP, preferring Cloudflare/proxy headers."""
@@ -105,6 +105,91 @@ def _report_version_stats() -> None:
 
 
 _scheduler_task: Optional[asyncio.Task] = None
+_scheduled_analysis_max_concurrency = int(os.getenv("TA_SCHEDULED_ANALYSIS_MAX_CONCURRENCY", "10"))
+_scheduled_analysis_semaphore: Optional[asyncio.Semaphore] = None
+_scheduled_analysis_queue_lock: Optional[asyncio.Lock] = None
+_scheduled_analysis_waiting_job_ids: list[str] = []
+_scheduled_analysis_running_job_ids: set[str] = set()
+
+
+def _ensure_scheduled_analysis_queue() -> tuple[asyncio.Semaphore, asyncio.Lock]:
+    global _scheduled_analysis_semaphore, _scheduled_analysis_queue_lock
+    if _scheduled_analysis_semaphore is None:
+        _scheduled_analysis_semaphore = asyncio.Semaphore(_scheduled_analysis_max_concurrency)
+    if _scheduled_analysis_queue_lock is None:
+        _scheduled_analysis_queue_lock = asyncio.Lock()
+    return _scheduled_analysis_semaphore, _scheduled_analysis_queue_lock
+
+
+async def _scheduled_analysis_acquire(job_id: str, symbol: str) -> None:
+    semaphore, queue_lock = _ensure_scheduled_analysis_queue()
+
+    async with queue_lock:
+        _scheduled_analysis_waiting_job_ids.append(job_id)
+        queue_position = _scheduled_analysis_waiting_job_ids.index(job_id) + 1
+        running_count = len(_scheduled_analysis_running_job_ids)
+        _set_job(
+            job_id,
+            queue_position=queue_position,
+            waiting_ahead_count=max(0, queue_position - 1),
+            scheduled_running_count=running_count,
+            scheduled_concurrency_limit=_scheduled_analysis_max_concurrency,
+        )
+        _log(
+            f"[Scheduled Queue] queued job={job_id} symbol={symbol} "
+            f"waiting_position={queue_position} running={running_count}/{_scheduled_analysis_max_concurrency}"
+        )
+
+    await semaphore.acquire()
+
+    async with queue_lock:
+        if job_id in _scheduled_analysis_waiting_job_ids:
+            _scheduled_analysis_waiting_job_ids.remove(job_id)
+        _scheduled_analysis_running_job_ids.add(job_id)
+        _set_job(
+            job_id,
+            queue_position=None,
+            waiting_ahead_count=None,
+            scheduled_running_count=len(_scheduled_analysis_running_job_ids),
+            scheduled_concurrency_limit=_scheduled_analysis_max_concurrency,
+        )
+        _log(
+            f"[Scheduled Queue] acquired slot job={job_id} symbol={symbol} "
+            f"running={len(_scheduled_analysis_running_job_ids)}/{_scheduled_analysis_max_concurrency} "
+            f"waiting={len(_scheduled_analysis_waiting_job_ids)}"
+        )
+
+
+async def _scheduled_analysis_release(job_id: str, symbol: str) -> None:
+    semaphore, queue_lock = _ensure_scheduled_analysis_queue()
+
+    async with queue_lock:
+        _scheduled_analysis_running_job_ids.discard(job_id)
+        if job_id in _scheduled_analysis_waiting_job_ids:
+            _scheduled_analysis_waiting_job_ids.remove(job_id)
+        _set_job(
+            job_id,
+            queue_position=None,
+            waiting_ahead_count=None,
+            scheduled_running_count=len(_scheduled_analysis_running_job_ids),
+            scheduled_concurrency_limit=_scheduled_analysis_max_concurrency,
+        )
+        _log(
+            f"[Scheduled Queue] released slot job={job_id} symbol={symbol} "
+            f"running={len(_scheduled_analysis_running_job_ids)}/{_scheduled_analysis_max_concurrency} "
+            f"waiting={len(_scheduled_analysis_waiting_job_ids)}"
+        )
+
+    semaphore.release()
+
+
+@asynccontextmanager
+async def _scheduled_analysis_slot(job_id: str, symbol: str):
+    await _scheduled_analysis_acquire(job_id, symbol)
+    try:
+        yield
+    finally:
+        await _scheduled_analysis_release(job_id, symbol)
 
 
 async def _scheduler_loop():
@@ -132,8 +217,7 @@ async def _scheduler_loop():
             if 8 * 60 < time_val < 20 * 60:
                 continue
 
-            db = SessionLocal()
-            try:
+            with get_db_ctx() as db:
                 tasks = scheduled_service.get_pending_tasks(db, today, current_hhmm)
                 if not tasks:
                     continue
@@ -156,14 +240,140 @@ async def _scheduler_loop():
                     for task in tasks
                 ]
 
-                _log(f"[Scheduler] Launching {len(task_snapshots)} tasks")
-                for snap in task_snapshots:
+                _log(f"[Scheduler] Launching {len(task_snapshots)} tasks (staggered)")
+                for i, snap in enumerate(task_snapshots):
+                    if i > 0:
+                        await asyncio.sleep(1)
                     _create_tracked_task(_run_scheduled_job(snap, today))
-            finally:
-                db.close()
 
         except Exception as e:
             logger.error(f"[Scheduler] Error: {e}")
+
+
+def _resolve_scheduled_trade_date(trade_date: str) -> str:
+    """Use the requested trading day, or fall back to the latest CN trading day."""
+    from tradingagents.dataflows.trade_calendar import is_cn_trading_day, previous_cn_trading_day
+
+    return trade_date if is_cn_trading_day(trade_date) else previous_cn_trading_day(trade_date)
+
+
+def _build_scheduled_analyze_request(
+    db: Session,
+    user_id: str,
+    symbol: str,
+    horizon: str,
+    trade_date: str,
+    scheduled_user_context: Optional[Dict[str, Any]] = None,
+) -> "AnalyzeRequest":
+    scheduled_user_context = scheduled_user_context or _build_imported_user_context(db, user_id, symbol)
+    return AnalyzeRequest(
+        symbol=symbol,
+        trade_date=trade_date,
+        horizons=[horizon],
+        query=f"定时分析 {symbol}",
+        user_intent={
+            "ticker": symbol,
+            "horizons": [horizon],
+            "focus_areas": [],
+            "specific_questions": [],
+            "user_context": scheduled_user_context,
+        },
+        objective=scheduled_user_context.get("objective"),
+        current_position=scheduled_user_context.get("current_position"),
+        current_position_pct=scheduled_user_context.get("current_position_pct"),
+        average_cost=scheduled_user_context.get("average_cost"),
+        user_notes=scheduled_user_context.get("user_notes"),
+    )
+
+
+async def _send_scheduled_report_notifications(user_id: str, report_id: str, symbol: str) -> None:
+    """Send configured scheduled report notifications."""
+    try:
+        from api.services.email_report_service import send_report_email_with_retry
+        from api.services.wecom_notification_service import send_report_message_with_retry
+
+        email_user = None
+        report_to_send = None
+        webhook_url = None
+        wecom_report_enabled = True
+        with get_db_ctx() as db:
+            user = db.query(UserDB).filter(UserDB.id == user_id).first()
+            report = db.query(ReportDB).filter(ReportDB.id == report_id).first()
+            user_cfg = auth_service.get_user_llm_config(db, user_id)
+            webhook_url = auth_service.decrypt_secret(getattr(user_cfg, "wecom_webhook_encrypted", None))
+            if report:
+                db.expunge(report)
+                report_to_send = report
+            if user:
+                wecom_report_enabled = getattr(user, "wecom_report_enabled", True)
+                if getattr(user, "email_report_enabled", True):
+                    db.expunge(user)
+                    email_user = user
+        if email_user and report_to_send:
+            _log(f"[Scheduler] Sending email report for {symbol} to {email_user.email}")
+            _create_tracked_task(
+                send_report_email_with_retry(email_user, report_to_send),
+                label=f"Email notification task ({symbol})",
+            )
+        if report_to_send and webhook_url and wecom_report_enabled:
+            _log(f"[Scheduler] Sending WeCom report for {symbol}")
+            _create_tracked_task(
+                send_report_message_with_retry(report_to_send, webhook_url),
+                label=f"WeCom notification task ({symbol})",
+            )
+    except Exception as e:
+        logger.warning(f"[Scheduler] Notification send failed for {symbol}: {e}")
+
+
+async def _run_scheduled_analysis_once(
+    task: dict,
+    requested_trade_date: str,
+    job_id: str,
+    *,
+    mark_schedule_run: bool,
+) -> None:
+    """Execute one scheduled analysis, optionally recording it as the daily scheduled run."""
+    task_id = task["id"]
+    user_id = task["user_id"]
+    symbol = task["symbol"]
+    horizon = task.get("horizon") or "short"
+
+    _ensure_job_event_queue(job_id)
+    actual_trade_date = _resolve_scheduled_trade_date(requested_trade_date)
+    _log(f"[Scheduler] {symbol} trade_date={actual_trade_date} (requested={requested_trade_date})")
+
+    try:
+        async with _scheduled_analysis_slot(job_id, symbol):
+            with get_db_ctx() as db:
+                scheduled_user_context = task.get("manual_user_context") or _build_imported_user_context(db, user_id, symbol)
+                req = _build_scheduled_analyze_request(
+                    db=db,
+                    user_id=user_id,
+                    symbol=symbol,
+                    horizon=horizon,
+                    trade_date=actual_trade_date,
+                    scheduled_user_context=scheduled_user_context,
+                )
+
+            await _run_job(job_id, req, False, True, user_id, "scheduled" if mark_schedule_run else "scheduled_manual")
+        job_state = _get_job(job_id)
+        if job_state.get("status") == "failed":
+            raise RuntimeError(job_state.get("error") or f"scheduled analysis job {job_id} failed")
+        with get_db_ctx() as db:
+            if mark_schedule_run:
+                scheduled_service.mark_run_success(db, task_id, requested_trade_date, job_id)
+            else:
+                scheduled_service.record_manual_test_result(db, task_id, "success", report_id=job_id)
+        _log(f"[Scheduler] Completed {symbol}")
+
+        await _send_scheduled_report_notifications(user_id, job_id, symbol)
+    except Exception as e:
+        logger.error(f"[Scheduler] Failed {symbol}: {e}\n{traceback.format_exc()}")
+        with get_db_ctx() as db:
+            if mark_schedule_run:
+                scheduled_service.mark_run_failed(db, task_id, requested_trade_date)
+            else:
+                scheduled_service.record_manual_test_result(db, task_id, "failed")
 
 
 async def _run_scheduled_job(task: dict, trade_date: str):
@@ -174,53 +384,18 @@ async def _run_scheduled_job(task: dict, trade_date: str):
               not an ORM instance, to avoid DetachedInstanceError).
         trade_date: YYYY-MM-DD string.
     """
-    task_id = task["id"]
     user_id = task["user_id"]
     symbol = task["symbol"]
-    horizon = task.get("horizon") or "short"
 
     _log(f"[Scheduler] Running {symbol} for user={user_id}")
     job_id = uuid4().hex
     try:
-        _ensure_job_event_queue(job_id)
-
-        # 使用最近交易日（非交易日时回退到上一个交易日）
-        from tradingagents.dataflows.trade_calendar import is_cn_trading_day, previous_cn_trading_day
-        actual_trade_date = trade_date if is_cn_trading_day(trade_date) else previous_cn_trading_day(trade_date)
-        _log(f"[Scheduler] {symbol} trade_date={actual_trade_date} (requested={trade_date})")
-
-        req = AnalyzeRequest(
-            symbol=symbol,
-            trade_date=actual_trade_date,
-            horizons=[horizon],
-            query=f"定时分析 {symbol}",
-            user_intent={
-                "ticker": symbol,
-                "horizons": [horizon],
-                "focus_areas": [],
-                "specific_questions": [],
-                "user_context": {},
-            },
+        await _run_scheduled_analysis_once(
+            task,
+            trade_date,
+            job_id,
+            mark_schedule_run=True,
         )
-
-        await _run_job(job_id, req, user_id=user_id)
-
-        # Mark success
-        db = SessionLocal()
-        try:
-            scheduled_service.mark_run_success(db, task_id, trade_date, job_id)
-        finally:
-            db.close()
-        _log(f"[Scheduler] Completed {symbol}")
-
-    except Exception as e:
-        import traceback
-        logger.error(f"[Scheduler] Failed {symbol}: {e}\n{traceback.format_exc()}")
-        db = SessionLocal()
-        try:
-            scheduled_service.mark_run_failed(db, task_id, trade_date)
-        finally:
-            db.close()
     finally:
         _job_events.pop(job_id, None)
 
@@ -228,9 +403,18 @@ async def _run_scheduled_job(task: dict, trade_date: str):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize resources on startup and cleanup on shutdown."""
-    global _scheduler_task
+    global _scheduler_task, _scheduled_analysis_semaphore, _scheduled_analysis_queue_lock
     init_db()
     _log("Database initialized.")
+    with _jobs_lock:
+        _jobs.clear()
+        _job_events.clear()
+    _background_tasks.clear()
+    _scheduled_analysis_semaphore = asyncio.Semaphore(_scheduled_analysis_max_concurrency)
+    _scheduled_analysis_queue_lock = asyncio.Lock()
+    _scheduled_analysis_waiting_job_ids.clear()
+    _scheduled_analysis_running_job_ids.clear()
+    _log(f"[Scheduled Queue] Concurrency limit set to {_scheduled_analysis_max_concurrency}")
 
     # Security: warn loudly if using default secret key
     if not os.getenv("TA_APP_SECRET_KEY"):
@@ -241,24 +425,39 @@ async def lifespan(app: FastAPI):
         _log("=" * 70)
 
     _report_version_stats()
-    # 启动时把卡在 running 的定时任务重置，让它们今天可以重新触发
-    db = SessionLocal()
-    try:
+    # 启动时把卡在 running 的定时任务重置
+    with get_db_ctx() as db:
         stale = db.query(ScheduledAnalysisDB).filter(
             ScheduledAnalysisDB.last_run_status == "running"
         ).all()
         if stale:
             for item in stale:
-                item.last_run_status = "stale"
-                item.last_run_date = None  # 允许今天重新触发
+                # 检查是否已有对应的成功报告（任务实际完成了但状态卡在 running）
+                has_report = item.last_report_id and db.query(ReportDB).filter(
+                    ReportDB.id == item.last_report_id,
+                    ReportDB.status == "completed",
+                ).first()
+                if has_report:
+                    item.last_run_status = "success"
+                    # 保留 last_run_date，不重新触发
+                else:
+                    item.last_run_status = "stale"
+                    item.last_run_date = None  # 真正未完成，允许重新触发
             db.commit()
             _log(f"[Scheduler] Reset {len(stale)} stale 'running' tasks on startup.")
-    finally:
-        db.close()
+        report_reset = report_service.recover_stale_active_reports(db)
+        if report_reset["total"]:
+            _log(
+                "[Reports] Recovered %s stale active reports on startup (marked failed)."
+                % report_reset["total"]
+            )
     # Pre-load trade calendar (uses mini_racer/V8 which is not thread-safe)
     from tradingagents.dataflows.trade_calendar import _load_cn_trade_dates
     _load_cn_trade_dates()
     _log("Trade calendar pre-loaded.")
+    # Pre-load stock + ETF name map
+    await asyncio.to_thread(_load_cn_stock_map)
+    _log("Stock map pre-loaded on startup.")
     _scheduler_task = asyncio.create_task(_scheduler_loop())
     yield
     _log("Shutting down: Cleaning up resources...")
@@ -322,6 +521,7 @@ _background_tasks: set = set()
 
 # ── A-share stock name → code cache ──────────────────────────────────────────
 _cn_stock_map: Optional[Dict[str, str]] = None  # name -> "XXXXXX.SH/SZ"
+_cn_stock_reverse_map: Optional[Dict[str, str]] = None  # code -> name
 _cn_stock_map_lock = Lock()
 
 
@@ -329,7 +529,8 @@ def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _create_tracked_task(coro) -> asyncio.Task:
+_JOB_TIMEOUT = int(os.getenv("TA_JOB_TIMEOUT", "600"))  # seconds
+def _create_tracked_task(coro, *, label: str = "Background task") -> asyncio.Task:
     """Create an asyncio task and keep a reference to prevent GC.
     Also logs unhandled exceptions via a done callback."""
     task = asyncio.create_task(coro)
@@ -338,7 +539,7 @@ def _create_tracked_task(coro) -> asyncio.Task:
     def _on_done(t: asyncio.Task):
         _background_tasks.discard(t)
         if not t.cancelled() and t.exception():
-            logger.error("Background task failed: %s", t.exception())
+            logger.error("%s failed: %s", label, t.exception())
 
     task.add_done_callback(_on_done)
     return task
@@ -364,41 +565,77 @@ _STOCK_MAP_TTL = 7 * 86400  # 7 days
 
 
 def _load_cn_stock_map() -> Dict[str, str]:
-    """Lazy-load and cache akshare A-share name→code mapping with 7-day TTL."""
-    global _cn_stock_map, _cn_stock_map_loaded_at
+    """Lazy-load and cache A-share stock + ETF/fund name→code mapping (7-day TTL).
+
+    Uses akshare stock_info_a_code_name (static list, no anti-crawl) for A-shares,
+    plus fund_name_em for ETFs/funds.
+    """
+    global _cn_stock_map, _cn_stock_reverse_map, _cn_stock_map_loaded_at
     import time as _time
     now = _time.time()
     if _cn_stock_map is not None and (now - _cn_stock_map_loaded_at) > _STOCK_MAP_TTL:
         _cn_stock_map = None  # expire cache
+        _cn_stock_reverse_map = None
     if _cn_stock_map is not None:
         return _cn_stock_map
     with _cn_stock_map_lock:
         if _cn_stock_map is not None and (now - _cn_stock_map_loaded_at) <= _STOCK_MAP_TTL:
             return _cn_stock_map
+        result: Dict[str, str] = {}
         try:
             import akshare as ak
+            # A-share stocks (static list, no anti-crawl issue)
             df = ak.stock_info_a_code_name()
-            result: Dict[str, str] = {}
             for _, row in df.iterrows():
                 name = str(row.get("name", "")).strip()
                 code = str(row.get("code", "")).strip()
                 if name and code:
-                    normalized = _normalize_symbol(code)
-                    result[name] = normalized
+                    result[name] = _normalize_symbol(code)
+            stock_count = len(result)
+            # ETF / funds
+            fund_count = 0
+            try:
+                fund_df = ak.fund_name_em()
+                existing_codes = set(result.values())
+                for _, row in fund_df.iterrows():
+                    code = str(row.get("基金代码", "")).strip()
+                    name = str(row.get("基金简称", "")).strip()
+                    if name and code and len(code) == 6 and code.isdigit():
+                        normalized = _normalize_symbol(code)
+                        if normalized not in existing_codes:
+                            result[name] = normalized
+                            existing_codes.add(normalized)
+                fund_count = len(result) - stock_count
+            except Exception as fe:
+                _log(f"[StockMap] ETF/fund load skipped: {fe}")
             _cn_stock_map = result
+            _cn_stock_reverse_map = {code: name for name, code in result.items()}
             _cn_stock_map_loaded_at = now
-            _log(f"[StockMap] Loaded {len(result)} A-share stocks.")
+            _log(f"[StockMap] Loaded {stock_count} stocks + {fund_count} ETFs/funds = {len(result)} total.")
         except Exception as e:
             _log(f"[StockMap] Failed to load: {e}")
             if _cn_stock_map is None:
                 _cn_stock_map = {}
+                _cn_stock_reverse_map = {}
     return _cn_stock_map
 
 
 def _get_reverse_stock_map() -> Dict[str, str]:
     """Return code→name mapping."""
-    name_to_code = _load_cn_stock_map()
-    return {v: k for k, v in name_to_code.items()}
+    _load_cn_stock_map()
+    return dict(_cn_stock_reverse_map or {})
+
+
+def _get_reverse_stock_map_cached_only() -> Dict[str, str]:
+    """Return code→name mapping only from already-warmed cache.
+
+    For list pages we prefer a fast response over blocking on a cold AkShare lookup.
+    When the cache is cold we simply return an empty mapping and let the UI fall back
+    to stock codes. Search endpoints can still call _load_cn_stock_map() explicitly.
+    """
+    if _cn_stock_map is None or _cn_stock_reverse_map is None:
+        return {}
+    return dict(_cn_stock_reverse_map)
 
 
 def _search_cn_stock_by_name(query: str) -> Optional[str]:
@@ -420,6 +657,29 @@ def _search_cn_stock_by_name(query: str) -> Optional[str]:
         candidates.sort(key=lambda x: len(x[0]))
         return candidates[0][1]
     return None
+
+
+def _split_watchlist_batch_text(text: str) -> List[str]:
+    return [token.strip() for token in re.split(r"[\s,，、；;]+", text.strip()) if token.strip()]
+
+
+def _resolve_watchlist_identifier(
+    raw: str,
+    name_to_code: Dict[str, str],
+    code_to_name: Dict[str, str],
+) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    token = raw.strip()
+    if not token:
+        return None, None, "输入为空"
+    if token in name_to_code:
+        symbol = name_to_code[token]
+        return symbol, code_to_name.get(symbol, token), None
+    symbol = _normalize_symbol(token)
+    if symbol in code_to_name:
+        return symbol, code_to_name.get(symbol, symbol), None
+    return None, None, f"未识别的股票代码或名称: {token}"
+
+
 _auth_scheme = HTTPBearer(auto_error=False)
 
 FIXED_TEAMS = {
@@ -430,21 +690,22 @@ FIXED_TEAMS = {
         "Fundamentals Analyst",
         "Macro Analyst",
         "Smart Money Analyst",
+        "Volume Price Analyst",
     ],
-    "Research Team": ["Game Theory Manager", "Bull Researcher", "Bear Researcher", "Research Manager"],
+    "Research Team": ["Bull Researcher", "Bear Researcher", "Research Manager"],
     "Trading Team": ["Trader"],
     "Risk Management": ["Aggressive Analyst", "Neutral Analyst", "Conservative Analyst"],
     "Portfolio Management": ["Portfolio Manager"],
 }
-ANALYST_ORDER = ["market", "social", "news", "fundamentals", "macro", "smart_money"]
+ANALYST_ORDER = ["market", "social", "news", "fundamentals", "macro", "smart_money", "volume_price"]
 ANALYST_AGENT_NAMES = {
     "market": "Market Analyst",
     "social": "Social Analyst",
     "news": "News Analyst",
     "fundamentals": "Fundamentals Analyst",
     "macro": "Macro Analyst",
+    "volume_price": "Volume Price Analyst",
     "smart_money": "Smart Money Analyst",
-    "game_theory": "Game Theory Manager",
     "bull": "Bull Researcher",
     "bear": "Bear Researcher",
     "Bull_Initial": "Bull Researcher",
@@ -465,20 +726,14 @@ ANALYST_REPORT_MAP = {
     "fundamentals": "fundamentals_report",
     "macro": "macro_report",
     "smart_money": "smart_money_report",
+    "volume_price": "volume_price_report",
 }
 
-# Analysts that are relevant per investment horizon
-HORIZON_ANALYSTS = {
-    "short": ["market", "social", "news", "smart_money"],
-    "medium": ["market", "news", "fundamentals", "macro"],
-}
-
-
+# All analysts always run — each uses its own natural time window
+# (technical/funds → short, fundamentals/macro → medium)
 def _get_horizon_analysts(horizon: str, available: List[str]) -> List[str]:
-    """Return the subset of available analysts relevant for the given horizon."""
-    relevant = set(HORIZON_ANALYSTS.get(horizon, available))
-    filtered = [a for a in available if a in relevant]
-    return filtered if filtered else list(available)
+    """Return all available analysts regardless of horizon."""
+    return list(available)
 
 
 def _announcements_file() -> Path:
@@ -542,6 +797,25 @@ class AnalyzeResponse(BaseModel):
     created_at: str
 
 
+class BatchScheduledTriggerJob(BaseModel):
+    item_id: str
+    job_id: str
+    symbol: str
+    name: str
+    status: Literal["pending", "running", "completed", "failed"]
+    created_at: str
+    current_position: Optional[float] = None
+    average_cost: Optional[float] = None
+    waiting_ahead_count: Optional[int] = None
+    scheduled_running_count: Optional[int] = None
+    scheduled_concurrency_limit: Optional[int] = None
+
+
+class BatchScheduledTriggerResponse(BaseModel):
+    summary: Dict[str, int]
+    jobs: List[BatchScheduledTriggerJob]
+
+
 class JobStatusResponse(BaseModel):
     job_id: str
     status: Literal["pending", "running", "completed", "failed"]
@@ -551,6 +825,9 @@ class JobStatusResponse(BaseModel):
     symbol: str
     trade_date: str
     error: Optional[str] = None
+    waiting_ahead_count: Optional[int] = None
+    scheduled_running_count: Optional[int] = None
+    scheduled_concurrency_limit: Optional[int] = None
 
 
 class ChatMessage(BaseModel):
@@ -588,6 +865,7 @@ class ReportResponse(BaseModel):
     id: str
     user_id: Optional[str]
     symbol: str
+    name: Optional[str] = None
     trade_date: str
     status: Literal["pending", "running", "completed", "failed"] = "completed"
     error: Optional[str] = None
@@ -601,6 +879,9 @@ class ReportResponse(BaseModel):
     analyst_traces: Optional[List[Dict[str, Any]]] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
+    waiting_ahead_count: Optional[int] = None
+    scheduled_running_count: Optional[int] = None
+    scheduled_concurrency_limit: Optional[int] = None
 
     model_config = {"from_attributes": True}
 
@@ -616,6 +897,7 @@ class ReportDetailResponse(ReportResponse):
     fundamentals_report: Optional[str]
     macro_report: Optional[str]
     smart_money_report: Optional[str]
+    volume_price_report: Optional[str]
     game_theory_report: Optional[str]
     investment_plan: Optional[str]
     trader_investment_plan: Optional[str]
@@ -626,6 +908,46 @@ class ReportDetailResponse(ReportResponse):
 class ReportListResponse(BaseModel):
     total: int
     reports: List[ReportResponse]
+
+
+class ReportBatchDeleteRequest(BaseModel):
+    report_ids: List[str] = Field(default_factory=list)
+
+
+class ReportBatchDeleteResponse(BaseModel):
+    deleted_ids: List[str]
+    missing_ids: List[str]
+
+
+class LatestReportsBySymbolsRequest(BaseModel):
+    symbols: List[str] = Field(default_factory=list)
+
+
+class LatestReportsBySymbolsResponse(BaseModel):
+    reports: List[ReportResponse]
+
+
+class PortfolioOverviewResponse(BaseModel):
+    watchlist: List[dict]
+    scheduled: List[dict]
+    latest_reports: List[ReportResponse]
+    portfolio_import: Optional[dict] = None
+
+
+class WatchlistAddRequest(BaseModel):
+    text: Optional[str] = None
+    symbol: Optional[str] = None
+
+
+class ScheduledBatchIdsRequest(BaseModel):
+    item_ids: List[str] = Field(default_factory=list)
+
+
+class ScheduledBatchUpdateRequest(BaseModel):
+    item_ids: List[str] = Field(default_factory=list)
+    is_active: Optional[bool] = None
+    horizon: Optional[str] = None
+    trigger_time: Optional[str] = None
 
 
 class AnnouncementItemResponse(BaseModel):
@@ -653,6 +975,7 @@ class UserResponse(BaseModel):
     email: str
     created_at: Optional[datetime] = None
     last_login_at: Optional[datetime] = None
+    email_report_enabled: bool = True
 
     model_config = {"from_attributes": True}
 
@@ -684,7 +1007,11 @@ class UserRuntimeConfigResponse(BaseModel):
     max_debate_rounds: int
     max_risk_discuss_rounds: int
     has_api_key: bool = False
+    has_wecom_webhook: bool = False
+    wecom_webhook_display: Optional[str] = None
     server_fallback_enabled: bool = True
+    email_report_enabled: bool = True
+    wecom_report_enabled: bool = True
 
 
 class UserRuntimeConfigUpdateRequest(BaseModel):
@@ -694,8 +1021,57 @@ class UserRuntimeConfigUpdateRequest(BaseModel):
     backend_url: Optional[str] = None
     max_debate_rounds: Optional[int] = None
     max_risk_discuss_rounds: Optional[int] = None
+    email_report_enabled: Optional[bool] = None
+    wecom_report_enabled: Optional[bool] = None
     api_key: Optional[str] = None
+    wecom_webhook_url: Optional[str] = None
     clear_api_key: bool = False
+    clear_wecom_webhook: bool = False
+    warmup: bool = True
+    force_warmup: bool = False
+
+
+class UserRuntimeWarmupRequest(UserRuntimeConfigUpdateRequest):
+    prompt: str = "你好"
+
+
+class RuntimeWarmupResult(BaseModel):
+    model: str
+    targets: List[str] = Field(default_factory=list)
+    content: Optional[str] = None
+    error: Optional[str] = None
+
+
+class UserRuntimeWarmupResponse(BaseModel):
+    prompt: str
+    results: List[RuntimeWarmupResult]
+
+
+class WecomWebhookWarmupRequest(BaseModel):
+    wecom_webhook_url: Optional[str] = None
+    content: Optional[str] = None
+
+
+class WecomWebhookWarmupResponse(BaseModel):
+    sent: bool = True
+    message: str
+    webhook_display: Optional[str] = None
+
+
+class PortfolioPositionItem(BaseModel):
+    symbol: str = Field(..., description="股票代码，如 600519.SH 或 600519")
+    name: Optional[str] = Field(None, description="股票名称")
+    current_position: Optional[float] = Field(None, description="持仓数量")
+    available_position: Optional[float] = Field(None, description="可用数量")
+    average_cost: Optional[float] = Field(None, description="成本价")
+    market_value: Optional[float] = Field(None, description="市值")
+    current_position_pct: Optional[float] = Field(None, description="仓位占比 %")
+
+
+class PortfolioImportSyncRequest(BaseModel):
+    positions: List[PortfolioPositionItem] = Field(..., description="持仓列表")
+    source: str = Field("manual", description="持仓来源标识")
+    auto_apply_scheduled: bool = Field(True, description="是否自动将持仓股票加入定时任务")
 
 
 class UserTokenResponse(BaseModel):
@@ -744,17 +1120,12 @@ def _deep_merge(base: Dict[str, Any], overrides: Dict[str, Any]) -> Dict[str, An
 def _user_config_overrides(user_id: Optional[str], db: Optional[Session] = None) -> Dict[str, Any]:
     if not user_id:
         return {}
-    
-    should_close = False
-    if db is None:
-        db = SessionLocal()
-        should_close = True
-        
-    try:
-        user_cfg = auth_service.get_user_llm_config(db, user_id)
+
+    def _query(sess: Session) -> Dict[str, Any]:
+        user_cfg = auth_service.get_user_llm_config(sess, user_id)
         if not user_cfg:
             return {}
-        overrides: Dict[str, Any] = {}
+        result: Dict[str, Any] = {}
         for key in (
             "llm_provider",
             "backend_url",
@@ -765,14 +1136,16 @@ def _user_config_overrides(user_id: Optional[str], db: Optional[Session] = None)
         ):
             value = getattr(user_cfg, key, None)
             if value is not None:
-                overrides[key] = value
+                result[key] = value
         api_key = auth_service.decrypt_secret(user_cfg.api_key_encrypted)
         if api_key:
-            overrides["api_key"] = api_key
-        return overrides
-    finally:
-        if should_close:
-            db.close()
+            result["api_key"] = api_key
+        return result
+
+    if db is not None:
+        return _query(db)
+    with get_db_ctx() as own_db:
+        return _query(own_db)
 
 
 def _build_runtime_config(overrides: Dict[str, Any], user_id: Optional[str] = None, db: Optional[Session] = None) -> Dict[str, Any]:
@@ -820,30 +1193,33 @@ class RequireUser:
     def __call__(
         self,
         credentials: Optional[HTTPAuthorizationCredentials] = Depends(_auth_scheme),
-        db: Session = Depends(get_db),
     ) -> UserDB:
         if not credentials:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="请先登录")
-        
+
         token = credentials.credentials
-        
-        # 1. 优先尝试 JWT (网页登录)
-        try:
-            payload = auth_service.decode_access_token(token)
-            user_id = str(payload.get("sub") or "")
-            user = auth_service.get_user_by_id(db, user_id)
-            if user and user.is_active:
-                return user
-        except Exception:
-            # 不是有效的 JWT 或已过期，尝试 API Token
-            pass
-            
-        # 2. 尝试 API Token (仅在允许时)
-        if self.allow_api_token and token.startswith(token_service.TOKEN_PREFIX):
-            user = token_service.verify_token(db, token)
-            if user and user.is_active:
-                return user
-                
+
+        with get_db_ctx() as db:
+            # 1. 优先尝试 JWT (网页登录)
+            try:
+                payload = auth_service.decode_access_token(token)
+                user_id = str(payload.get("sub") or "")
+                user = auth_service.get_user_by_id(db, user_id)
+                if user and user.is_active:
+                    # expunge 使 ORM 对象脱离 session，close 后仍可访问属性
+                    db.expunge(user)
+                    return user
+            except Exception:
+                # 不是有效的 JWT 或已过期，尝试 API Token
+                pass
+
+            # 2. 尝试 API Token (仅在允许时)
+            if self.allow_api_token and token.startswith(token_service.TOKEN_PREFIX):
+                user = token_service.verify_token(db, token)
+                if user and user.is_active:
+                    db.expunge(user)
+                    return user
+
         detail = "身份验证失败或该接口不支持 API Token 访问" if self.allow_api_token else "该接口仅限网页端登录访问"
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=detail)
 
@@ -855,7 +1231,6 @@ _require_web_user = RequireUser(allow_api_token=False)   # 仅限网页登录
 
 def _optional_user(
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(_auth_scheme),
-    db: Session = Depends(get_db),
 ) -> Optional[UserDB]:
     if not credentials:
         return None
@@ -866,7 +1241,11 @@ def _optional_user(
     user_id = str(payload.get("sub") or "")
     if not user_id:
         return None
-    return auth_service.get_user_by_id(db, user_id)
+    with get_db_ctx() as db:
+        user = auth_service.get_user_by_id(db, user_id)
+        if user:
+            db.expunge(user)
+        return user
 
 
 def _set_job(job_key: str, **kwargs) -> None:
@@ -874,6 +1253,11 @@ def _set_job(job_key: str, **kwargs) -> None:
         if job_key not in _jobs:
             _jobs[job_key] = {}
         _jobs[job_key].update(kwargs)
+
+
+def _get_job(job_key: str) -> Dict[str, Any]:
+    with _jobs_lock:
+        return dict(_jobs.get(job_key, {}))
 
 
 def _ensure_job_event_queue(job_id: str) -> "asyncio.Queue[Dict[str, Any]]":
@@ -912,6 +1296,20 @@ def _emit_job_event(job_id: str, event: str, data: Dict[str, Any]) -> None:
             q.put_nowait(payload)
 
 
+def _attach_job_runtime_state(target: Any, job_id: Optional[str]) -> Any:
+    if not job_id:
+        return target
+    job = _get_job(job_id)
+    if not job:
+        return target
+
+    for field in ("waiting_ahead_count", "scheduled_running_count", "scheduled_concurrency_limit"):
+        value = job.get(field)
+        if value is not None or hasattr(target, field):
+            setattr(target, field, value)
+    return target
+
+
 def _extract_request_user_context(request: UserContextInput) -> Dict[str, Any]:
     payload: Dict[str, Any] = {}
     for key in USER_CONTEXT_KEYS:
@@ -935,6 +1333,33 @@ def _merge_user_context_payload(
     return merged
 
 
+def _compose_analysis_user_context(
+    db: Session,
+    user_id: str,
+    symbol: str,
+    *,
+    explicit_context: Optional[Dict[str, Any]] = None,
+    inferred_context: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    imported_context = _build_manual_imported_user_context(db, user_id, symbol)
+    merged_with_imported = _merge_user_context_payload(inferred_context or {}, imported_context)
+    return _merge_user_context_payload(explicit_context or {}, merged_with_imported)
+
+
+def _apply_user_context_to_request(request: "AnalyzeRequest", user_context: Dict[str, Any]) -> "AnalyzeRequest":
+    request.objective = user_context.get("objective")
+    request.risk_profile = user_context.get("risk_profile")
+    request.investment_horizon = user_context.get("investment_horizon")
+    request.cash_available = user_context.get("cash_available")
+    request.current_position = user_context.get("current_position")
+    request.current_position_pct = user_context.get("current_position_pct")
+    request.average_cost = user_context.get("average_cost")
+    request.max_loss_pct = user_context.get("max_loss_pct")
+    request.constraints = user_context.get("constraints", [])
+    request.user_notes = user_context.get("user_notes")
+    return request
+
+
 def _build_result_payload(final_state: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "symbol": final_state.get("company_of_interest"),
@@ -950,6 +1375,7 @@ def _build_result_payload(final_state: Dict[str, Any]) -> Dict[str, Any]:
         "fundamentals_report": final_state.get("fundamentals_report"),
         "macro_report": final_state.get("macro_report"),
         "smart_money_report": final_state.get("smart_money_report"),
+        "volume_price_report": final_state.get("volume_price_report"),
         "game_theory_report": final_state.get("game_theory_report"),
         "game_theory_signals": final_state.get("game_theory_signals"),
         "analyst_traces": final_state.get("analyst_traces"),
@@ -986,6 +1412,7 @@ class AgentProgressTracker:
             "fundamentals_report": None,
             "macro_report": None,
             "smart_money_report": None,
+            "volume_price_report": None,
             "game_theory_report": None,
             "investment_plan": None,
             "trader_investment_plan": None,
@@ -1162,6 +1589,52 @@ class AgentProgressTracker:
             },
         )
 
+    def emit_debate_token(
+        self, debate: str, agent: str, round_num: int, token: str,
+    ) -> None:
+        """推送辩论 token（流式输出，每个 chunk 调用一次）"""
+        if not token:
+            return
+        try:
+            _emit_job_event(
+                self.job_id,
+                "agent.debate.token",
+                {
+                    "debate": debate,
+                    "agent": agent,
+                    "round": round_num,
+                    "token": token,
+                    "horizon": self.horizon,
+                },
+            )
+        except Exception:
+            pass
+
+    def emit_debate_message(
+        self, debate: str, agent: str, round_num: int,
+        content: str, is_verdict: bool = False,
+    ) -> None:
+        """推送辩论消息（每个 agent 每轮完成后调用一次）"""
+        if not content:
+            return
+        try:
+            _emit_job_event(
+                self.job_id,
+                "agent.debate",
+                {
+                    "debate": debate,
+                    "agent": agent,
+                    "round": round_num,
+                    "content": content,
+                    "is_verdict": is_verdict,
+                    "horizon": self.horizon,
+                },
+            )
+        except Exception:
+            logging.getLogger(__name__).warning(
+                "Failed to emit debate message for %s in %s", agent, debate, exc_info=True,
+            )
+
     def apply_chunk(self, chunk: Dict[str, Any]) -> None:
         # 分析师阶段状态推进
         found_active = False
@@ -1188,20 +1661,10 @@ class AgentProgressTracker:
             else:
                 self._set_status(agent_name, "pending")
 
-        # Game Theory Manager 状态跟踪
-        if chunk.get("game_theory_report"):
-            self.report_sections["game_theory_report"] = chunk.get("game_theory_report")
-            if self.status.get("Game Theory Manager") != "completed":
-                self._set_status("Game Theory Manager", "completed")
-        elif not found_active and self.selected_analysts:
-            if self.status.get("Game Theory Manager") == "pending":
-                self._set_status("Game Theory Manager", "in_progress")
-
+        # 分析师全部完成后，启动 Bull Researcher
         if not found_active and self.selected_analysts:
-            if self.status.get("Game Theory Manager") == "completed" and self.status.get("Bull Researcher") == "pending":
+            if self.status.get("Bull Researcher") == "pending":
                 self._set_status("Bull Researcher", "in_progress")
-            elif self.status.get("Game Theory Manager") != "completed" and self.status.get("Game Theory Manager") != "in_progress":
-                pass  # wait for game theory
 
         # 研究团队状态更新
         debate_state = chunk.get("investment_debate_state") or {}
@@ -1302,34 +1765,56 @@ async def _run_job(
     user_id: Optional[str] = None,
     request_source: str = "api",
 ) -> None:
+    try:
+        await asyncio.wait_for(
+            _run_job_inner(job_id, request, stream_events, save_report, user_id, request_source),
+            timeout=_JOB_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        err_msg = f"任务超时（超过 {_JOB_TIMEOUT} 秒），已自动终止"
+        _log(f"[Job {job_id}] {err_msg}")
+        _set_job(job_id, status="failed", error=err_msg, finished_at=_utcnow_iso())
+        try:
+            def _record_timeout():
+                with get_db_ctx() as db:
+                    report_service.mark_report_failed(db, job_id, err_msg)
+            await asyncio.to_thread(_record_timeout)
+        except Exception:
+            pass
+        _emit_job_event(job_id, "job.failed", {"job_id": job_id, "error": err_msg})
+
+
+async def _run_job_inner(
+    job_id: str,
+    request: AnalyzeRequest,
+    stream_events: bool = False,
+    save_report: bool = True,
+    user_id: Optional[str] = None,
+    request_source: str = "api",
+) -> None:
     job_start_t = time.time()
     # Normalize for logic but keep original for display
     display_name = request.symbol
     normalized_symbol = _normalize_symbol(request.symbol)
-    
+
     # ── Step 0: Initialize report in DB (short-lived session) ──
-    init_db = SessionLocal()
-    try:
-        def _init_report_sync():
-            report_service.init_report(
-                db=init_db,
-                report_id=job_id,
-                symbol=normalized_symbol,
-                trade_date=request.trade_date,
-                user_id=user_id,
-            )
-            report_service.update_report_partial(init_db, job_id, status="running")
-            init_db.commit()
+    def _init_and_configure():
+        with get_db_ctx() as db:
+            try:
+                report_service.init_report(
+                    db=db,
+                    report_id=job_id,
+                    symbol=normalized_symbol,
+                    trade_date=request.trade_date,
+                    user_id=user_id,
+                )
+                report_service.update_report_partial(db, job_id, status="running")
+                db.commit()
+            except Exception as e:
+                _log(f"CRITICAL: Failed to initialize report in DB: {e}")
+        return _build_runtime_config(request.config_overrides, user_id=user_id)
 
-        try:
-            await asyncio.to_thread(_init_report_sync)
-        except Exception as e:
-            _log(f"CRITICAL: Failed to initialize report in DB: {e}")
-            await asyncio.to_thread(init_db.rollback)
-
-        config = await asyncio.to_thread(_build_runtime_config, request.config_overrides, user_id=user_id, db=init_db)
-    finally:
-        await asyncio.to_thread(init_db.close)
+    config = await asyncio.to_thread(_init_and_configure)
 
     _set_job(job_id, status="running", started_at=_utcnow_iso(), symbol=normalized_symbol)
 
@@ -1432,7 +1917,7 @@ async def _run_job(
 
             report_keys = (
                 "market_report", "sentiment_report", "news_report", "fundamentals_report",
-                "macro_report", "smart_money_report", "game_theory_report",
+                "macro_report", "smart_money_report", "volume_price_report",
                 "investment_plan", "trader_investment_plan", "final_trade_decision",
             )
 
@@ -1440,131 +1925,137 @@ async def _run_job(
 
             async def _process_horizon(horizon: str):
                 """Async helper to run analysis for a single horizon."""
-                # Use a separate session for each parallel horizon to avoid race conditions
-                # since SessionLocal() produces a synchronous SQLAlchemy session.
-                h_db = SessionLocal()
+                # 根据周期过滤 analyst，共享已采集的数据缓存
+                horizon_analysts = _get_horizon_analysts(horizon, request.selected_analysts)
+                horizon_graph = TradingAgentsGraph(
+                    selected_analysts=horizon_analysts,
+                    debug=False,
+                    config=config,
+                    data_collector=graph.data_collector,
+                )
+
+                horizon_label = "短线" if horizon == "short" else "中线"
+                _emit_job_event(job_id, "agent.horizon_start", {
+                    "horizon": horizon, "label": horizon_label,
+                })
+                # 每轮重置 tracker，前端进度条重新走一遍
+                h_tracker = AgentProgressTracker(horizon_analysts, job_id, horizon=horizon)
+                _emit_job_event(job_id, "agent.snapshot", h_tracker.snapshot())
+                # 告知前端本轮参与的 analyst 即将开始
+                for analyst_key in ANALYST_ORDER:
+                    if analyst_key in horizon_analysts:
+                        aname = ANALYST_AGENT_NAMES[analyst_key]
+                        h_tracker._set_status(aname, "in_progress")
+                        h_tracker._emit_writing_status(aname, ANALYST_REPORT_MAP[analyst_key])
+
+                h_args = horizon_graph.propagator.get_graph_args()
+
+                # Use thread_id for LangGraph checkpointer persistence
+                if "config" not in h_args:
+                    h_args["config"] = {}
+                h_args["config"]["configurable"] = {"thread_id": f"{job_id}_{horizon}"}
+
+                init_state = horizon_graph.propagator.create_initial_state(
+                    ticker, request.trade_date,
+                    user_context=user_context_payload,
+                    selected_analysts=horizon_analysts,
+                    request_source=request_source,
+                    user_intent=user_intent, horizon=horizon,
+                )
+                last_report: Dict[str, str] = {}
+                seen: Dict[str, bool] = {}   # 追踪哪些字段已出现过，避免重复事件
+                horizon_final = None
+
+                # DB 更新使用短生命周期 session，避免长期占用连接池
+                def _horizon_partial_update(updates: dict):
+                    with get_db_ctx() as _hdb:
+                        report_service.update_report_partial(_hdb, job_id, **updates)
+
+                # 通过 ContextVar 将 tracker 传入 async 节点（LangGraph 不传递 schema 外的字段）
+                _tracker_token = current_tracker_var.set(h_tracker)
                 try:
-                    # 根据周期过滤 analyst，共享已采集的数据缓存
-                    horizon_analysts = _get_horizon_analysts(horizon, request.selected_analysts)
-                    horizon_graph = TradingAgentsGraph(
-                        selected_analysts=horizon_analysts,
-                        debug=False,
-                        config=config,
-                        data_collector=graph.data_collector,
-                    )
+                    async for chunk in horizon_graph.graph.astream(init_state, **h_args):
+                        horizon_final = chunk
 
-                    horizon_label = "短线" if horizon == "short" else "中线"
-                    _emit_job_event(job_id, "agent.horizon_start", {
-                        "horizon": horizon, "label": horizon_label,
-                    })
-                    # 每轮重置 tracker，前端进度条重新走一遍
-                    h_tracker = AgentProgressTracker(horizon_analysts, job_id, horizon=horizon)
-                    _emit_job_event(job_id, "agent.snapshot", h_tracker.snapshot())
-                    # 告知前端本轮参与的 analyst 即将开始
-                    for analyst_key in ANALYST_ORDER:
-                        if analyst_key in horizon_analysts:
+                        # ── 并行感知的状态推进 ──────────────────
+                        # 1. 每个 analyst 报告首次出现 → completed
+                        for analyst_key in ANALYST_ORDER:
+                            if analyst_key not in horizon_analysts:
+                                continue
+                            rkey = ANALYST_REPORT_MAP[analyst_key]
                             aname = ANALYST_AGENT_NAMES[analyst_key]
-                            h_tracker._set_status(aname, "in_progress")
-                            h_tracker._emit_writing_status(aname, ANALYST_REPORT_MAP[analyst_key])
+                            if chunk.get(rkey) and not seen.get(rkey):
+                                seen[rkey] = True
+                                h_tracker._set_status(aname, "completed")
 
-                    h_args = horizon_graph.propagator.get_graph_args()
-                    
-                    # Use thread_id for LangGraph checkpointer persistence
-                    if "config" not in h_args:
-                        h_args["config"] = {}
-                    h_args["config"]["configurable"] = {"thread_id": f"{job_id}_{horizon}"}
+                        # 2. 分析师全部完成后 → Bull/Bear/ResearchManager 开始
+                        all_analysts_done = all(
+                            seen.get(ANALYST_REPORT_MAP.get(a, "")) for a in h_tracker.selected_analysts
+                        )
+                        if all_analysts_done and not seen.get("_research_started"):
+                            seen["_research_started"] = True
+                            h_tracker._set_status(ANALYST_AGENT_NAMES["bull"], "in_progress")
+                            h_tracker._set_status(ANALYST_AGENT_NAMES["bear"], "in_progress")
+                            h_tracker._set_status(ANALYST_AGENT_NAMES["research_manager"], "in_progress")
 
-                    init_state = horizon_graph.propagator.create_initial_state(
-                        ticker, request.trade_date,
-                        user_context=user_context_payload,
-                        selected_analysts=horizon_analysts,
-                        request_source=request_source,
-                        user_intent=user_intent, horizon=horizon,
-                    )
-                    last_report: Dict[str, str] = {}
-                    seen: Dict[str, bool] = {}   # 追踪哪些字段已出现过，避免重复事件
-                    horizon_final = None
+                        # 3. research judge → 研究团队完成, Trader 开始
+                        debate = chunk.get("investment_debate_state") or {}
+                        if debate.get("judge_decision") and not seen.get("judge_decision"):
+                            seen["judge_decision"] = True
+                            for r_key in ["bull", "bear", "research_manager"]:
+                                h_tracker._set_status(ANALYST_AGENT_NAMES[r_key], "completed")
+                            h_tracker._set_status(ANALYST_AGENT_NAMES["trader"], "in_progress")
+                            h_tracker._emit_writing_status(ANALYST_AGENT_NAMES["trader"], "trader_investment_plan")
 
-                    # 通过 ContextVar 将 tracker 传入 async 节点（LangGraph 不传递 schema 外的字段）
-                    _tracker_token = current_tracker_var.set(h_tracker)
-                    try:
-                        async for chunk in horizon_graph.graph.astream(init_state, **h_args):
-                            horizon_final = chunk
+                        # 4. trader plan → Trader completed, 风控开始
+                        if chunk.get("trader_investment_plan") and not seen.get("trader_investment_plan"):
+                            seen["trader_investment_plan"] = True
+                            h_tracker._set_status(ANALYST_AGENT_NAMES["trader"], "completed")
+                            h_tracker._set_status(ANALYST_AGENT_NAMES["aggressive"], "in_progress")
 
-                            # ── 并行感知的状态推进 ──────────────────
-                            # 1. 每个 analyst 报告首次出现 → completed
-                            for analyst_key in ANALYST_ORDER:
-                                if analyst_key not in horizon_analysts:
-                                    continue
-                                rkey = ANALYST_REPORT_MAP[analyst_key]
-                                aname = ANALYST_AGENT_NAMES[analyst_key]
-                                if chunk.get(rkey) and not seen.get(rkey):
-                                    seen[rkey] = True
-                                    h_tracker._set_status(aname, "completed")
+                        # 5. risk judge → 风控全部完成
+                        risk = chunk.get("risk_debate_state") or {}
+                        if risk.get("judge_decision") and not seen.get("risk_judge_decision"):
+                            seen["risk_judge_decision"] = True
+                            for r_key in ["aggressive", "neutral", "conservative", "portfolio_manager"]:
+                                h_tracker._set_status(ANALYST_AGENT_NAMES[r_key], "completed")
+                        # ── end 并行感知 ────────────────────────────────────────────
 
-                            # 2. game_theory_report 出现 → GTM completed, Bull/Bear/ResearchManager 开始
-                            if chunk.get("game_theory_report") and not seen.get("game_theory_report"):
-                                seen["game_theory_report"] = True
-                                h_tracker._set_status(ANALYST_AGENT_NAMES["game_theory"], "completed")
-                                h_tracker._set_status(ANALYST_AGENT_NAMES["bull"], "in_progress")
-                                h_tracker._set_status(ANALYST_AGENT_NAMES["bear"], "in_progress")
-                                h_tracker._set_status(ANALYST_AGENT_NAMES["research_manager"], "in_progress")
+                        # 报告分片推送与数据库即时更新
+                        db_updates = {}
+                        for key in report_keys:
+                            value = chunk.get(key)
+                            if value and value != last_report.get(key):
+                                last_report[key] = value
+                                db_updates[key] = str(value)
+                                h_tracker._emit_report_chunked(job_id, key, str(value))
 
-                            # 3. research judge → 研究团队完成, Trader 开始
-                            debate = chunk.get("investment_debate_state") or {}
-                            if debate.get("judge_decision") and not seen.get("judge_decision"):
-                                seen["judge_decision"] = True
-                                for r_key in ["bull", "bear", "research_manager"]:
-                                    h_tracker._set_status(ANALYST_AGENT_NAMES[r_key], "completed")
-                                h_tracker._set_status(ANALYST_AGENT_NAMES["trader"], "in_progress")
-                                h_tracker._emit_writing_status(ANALYST_AGENT_NAMES["trader"], "trader_investment_plan")
-
-                            # 4. trader plan → Trader completed, 风控开始
-                            if chunk.get("trader_investment_plan") and not seen.get("trader_investment_plan"):
-                                seen["trader_investment_plan"] = True
-                                h_tracker._set_status(ANALYST_AGENT_NAMES["trader"], "completed")
-                                h_tracker._set_status(ANALYST_AGENT_NAMES["aggressive"], "in_progress")
-
-                            # 5. risk judge → 风控全部完成
-                            risk = chunk.get("risk_debate_state") or {}
-                            if risk.get("judge_decision") and not seen.get("risk_judge_decision"):
-                                seen["risk_judge_decision"] = True
-                                for r_key in ["aggressive", "neutral", "conservative", "portfolio_manager"]:
-                                    h_tracker._set_status(ANALYST_AGENT_NAMES[r_key], "completed")
-                            # ── end 并行感知 ────────────────────────────────────────────
-
-                            # 报告分片推送与数据库即时更新
-                            db_updates = {}
-                            for key in report_keys:
-                                value = chunk.get(key)
-                                if value and value != last_report.get(key):
-                                    last_report[key] = value
-                                    db_updates[key] = str(value)
-                                    h_tracker._emit_report_chunked(job_id, key, str(value))
-                            
-                            if db_updates:
-                                await asyncio.to_thread(report_service.update_report_partial, h_db, job_id, **db_updates)
-                    except Exception as e:
-                        _log(f"Error during horizon streaming ({horizon}): {e}")
-                    finally:
-                        current_tracker_var.reset(_tracker_token)
-
-                    horizon_states[horizon] = horizon_final
-                    for agent, st in h_tracker.status.items():
-                        if st not in ("completed", "skipped"):
-                            h_tracker._set_status(agent, "completed")
-                    _emit_job_event(job_id, "agent.horizon_done", {"horizon": horizon})
+                        if db_updates:
+                            await asyncio.to_thread(_horizon_partial_update, db_updates)
+                except Exception as e:
+                    _log(f"Error during horizon streaming ({horizon}): {e}")
+                    raise
                 finally:
-                    await asyncio.to_thread(h_db.close)
+                    current_tracker_var.reset(_tracker_token)
+
+                horizon_states[horizon] = horizon_final
+                for agent, st in h_tracker.status.items():
+                    if st not in ("completed", "skipped"):
+                        h_tracker._set_status(agent, "completed")
+                _emit_job_event(job_id, "agent.horizon_done", {"horizon": horizon})
 
             # 3. 按解析出的 horizons 并行运行 astream()，事件实时推给前端
             results = await asyncio.gather(
                 *[_process_horizon(h) for h in request.horizons],
                 return_exceptions=True,
             )
+            horizon_errors = []
             for i, r in enumerate(results):
                 if isinstance(r, Exception):
                     _log(f"Horizon '{request.horizons[i]}' failed: {r}")
+                    horizon_errors.append(f"{request.horizons[i]}: {r}")
+            if horizon_errors:
+                raise RuntimeError(f"Horizon analysis failed: {'; '.join(horizon_errors)}")
 
             graph.data_collector.evict(ticker, request.trade_date)
 
@@ -1591,6 +2082,7 @@ async def _run_job(
                 "fundamentals_report": primary_r.get("fundamentals_report", ""),
                 "macro_report": primary_r.get("macro_report", ""),
                 "smart_money_report": primary_r.get("smart_money_report", ""),
+                "volume_price_report": primary_r.get("volume_price_report", ""),
                 "analyst_traces": (
                     short_r.get("analyst_traces", []) + medium_r.get("analyst_traces", [])
                 ),
@@ -1626,8 +2118,7 @@ async def _run_job(
             # 自动保存报告到数据库
             if save_report:
                 def _save_report_sync():
-                    save_db = SessionLocal()
-                    try:
+                    with get_db_ctx() as save_db:
                         report_service.create_report(
                             db=save_db,
                             symbol=request.symbol,
@@ -1644,11 +2135,6 @@ async def _run_job(
                             analyst_traces=result.get("analyst_traces"),
                         )
                         save_db.commit()
-                    except Exception:
-                        save_db.rollback()
-                        raise
-                    finally:
-                        save_db.close()
 
                 try:
                     await asyncio.to_thread(_save_report_sync)
@@ -1695,7 +2181,7 @@ async def _run_job(
                 "fundamentals_report",
                 "macro_report",
                 "smart_money_report",
-                "game_theory_report",
+                "volume_price_report",
                 "investment_plan",
                 "trader_investment_plan",
                 "final_trade_decision",
@@ -1718,10 +2204,12 @@ async def _run_job(
                             seen[rkey] = True
                             tracker._set_status(aname, "completed")
 
-                    # 2. 其他团队状态推进
-                    if chunk.get("game_theory_report") and not seen.get("game_theory_report"):
-                        seen["game_theory_report"] = True
-                        tracker._set_status(ANALYST_AGENT_NAMES["game_theory"], "completed")
+                    # 2. 分析师全部完成 → 研究团队开始
+                    all_analysts_done = all(
+                        seen.get(ANALYST_REPORT_MAP.get(a, "")) for a in tracker.selected_analysts
+                    )
+                    if all_analysts_done and not seen.get("_research_started"):
+                        seen["_research_started"] = True
                         tracker._set_status(ANALYST_AGENT_NAMES["bull"], "in_progress")
                         tracker._set_status(ANALYST_AGENT_NAMES["bear"], "in_progress")
                         tracker._set_status(ANALYST_AGENT_NAMES["research_manager"], "in_progress")
@@ -1757,11 +2245,8 @@ async def _run_job(
                     
                     if db_updates:
                         def _partial_update(updates=db_updates):
-                            _db = SessionLocal()
-                            try:
+                            with get_db_ctx() as _db:
                                 report_service.update_report_partial(_db, job_id, **updates)
-                            finally:
-                                _db.close()
                         await asyncio.to_thread(_partial_update)
                     
                     # ── Message & Tool Call Handling ──
@@ -1864,8 +2349,7 @@ async def _run_job(
         # 自动保存/收口报告到数据库
         if save_report:
             def _save_report_final_sync():
-                save_db = SessionLocal()
-                try:
+                with get_db_ctx() as save_db:
                     report_service.create_report(
                         db=save_db,
                         symbol=request.symbol,
@@ -1882,11 +2366,6 @@ async def _run_job(
                         analyst_traces=result.get("analyst_traces"),
                     )
                     save_db.commit()
-                except Exception:
-                    save_db.rollback()
-                    raise
-                finally:
-                    save_db.close()
 
             try:
                 await asyncio.to_thread(_save_report_final_sync)
@@ -1930,11 +2409,8 @@ async def _run_job(
         # ── Persistent failure recording (short-lived session) ──
         try:
             def _record_failure():
-                err_db = SessionLocal()
-                try:
+                with get_db_ctx() as err_db:
                     report_service.mark_report_failed(err_db, job_id, f"{err_msg}\n\n{traceback.format_exc()}")
-                finally:
-                    err_db.close()
             await asyncio.to_thread(_record_failure)
         except Exception as db_exc:
             _log(f"Failed to record failure in DB: {db_exc}")
@@ -2180,7 +2656,7 @@ async def _stream_job_events(job_id: str):
     yield _sse_pack("job.ready", {"job_id": job_id})
     while True:
         try:
-            event = await asyncio.wait_for(q.get(), timeout=30)
+            event = await asyncio.wait_for(q.get(), timeout=15)
             yield _sse_pack(event["event"], event["data"])
             if event["event"] in ("job.completed", "job.failed"):
                 yield "event: done\ndata: [DONE]\n\n"
@@ -2384,6 +2860,15 @@ async def analyze(
     request: AnalyzeRequest,
     current_user: UserDB = Depends(_require_api_user),
 ) -> AnalyzeResponse:
+    with get_db_ctx() as db:
+        merged_user_context = _compose_analysis_user_context(
+            db,
+            current_user.id,
+            request.symbol,
+            explicit_context=_extract_request_user_context(request),
+        )
+    _apply_user_context_to_request(request, merged_user_context)
+
     job_id = uuid4().hex
     now = _utcnow_iso()
     _set_job(
@@ -2406,6 +2891,10 @@ async def analyze(
         "job.created",
         {"job_id": job_id, "symbol": request.symbol, "trade_date": request.trade_date},
     )
+    if request.dry_run:
+        await _run_job(job_id, request, True, True, current_user.id, "api")
+        final_status = _jobs.get(job_id, {}).get("status", "completed")
+        return AnalyzeResponse(job_id=job_id, status=final_status, created_at=now)
     _create_tracked_task(_run_job(job_id, request, True, True, current_user.id, "api"))
     return AnalyzeResponse(job_id=job_id, status="pending", created_at=now)
 
@@ -2433,6 +2922,9 @@ def get_job_status(job_id: str, current_user: UserDB = Depends(_require_api_user
         symbol=job["symbol"],
         trade_date=job["trade_date"],
         error=job.get("error"),
+        waiting_ahead_count=job.get("waiting_ahead_count"),
+        scheduled_running_count=job.get("scheduled_running_count"),
+        scheduled_concurrency_limit=job.get("scheduled_concurrency_limit"),
     )
 
 
@@ -2665,10 +3157,9 @@ def _ai_extract_symbol_and_date(
 async def chat_completions(
     request: ChatCompletionRequest,
     current_user: UserDB = Depends(_require_api_user),
-    db: Session = Depends(get_db),
 ):
     text = _extract_chat_text(request.messages)
-    config = await asyncio.to_thread(_build_runtime_config, request.config_overrides, user_id=current_user.id, db=db)
+    config = await asyncio.to_thread(_build_runtime_config, request.config_overrides, user_id=current_user.id)
 
     # ── 流式模式：立刻返回 SSE 流，在后台异步提取意图再启动任务 ──────────────────
     # 这样用户提交查询后立刻收到 job.ready，不用等待 thinking 模型的 StockExtract。
@@ -2693,12 +3184,16 @@ async def chat_completions(
                     "horizons": horizons,
                     "focus_areas": focus_areas,
                     "specific_questions": specific_questions,
-                    "user_context": inferred_user_context,
                 }
-                merged_user_context = _merge_user_context_payload(
-                    _extract_request_user_context(request),
-                    inferred_user_context,
-                )
+                with get_db_ctx() as db:
+                    merged_user_context = _compose_analysis_user_context(
+                        db,
+                        current_user.id,
+                        symbol,
+                        explicit_context=_extract_request_user_context(request),
+                        inferred_context=inferred_user_context,
+                    )
+                pre_intent["user_context"] = merged_user_context
                 analyze_req = AnalyzeRequest(
                     symbol=symbol,
                     trade_date=trade_date or cn_today_str(),
@@ -2764,12 +3259,16 @@ async def chat_completions(
         "horizons": horizons,
         "focus_areas": focus_areas,
         "specific_questions": specific_questions,
-        "user_context": inferred_user_context,
     }
-    merged_user_context = _merge_user_context_payload(
-        _extract_request_user_context(request),
-        inferred_user_context,
-    )
+    with get_db_ctx() as db:
+        merged_user_context = _compose_analysis_user_context(
+            db,
+            current_user.id,
+            symbol,
+            explicit_context=_extract_request_user_context(request),
+            inferred_context=inferred_user_context,
+        )
+    pre_intent["user_context"] = merged_user_context
     analyze_req = AnalyzeRequest(
         symbol=symbol,
         trade_date=trade_date or cn_today_str(),
@@ -2812,6 +3311,30 @@ async def chat_completions(
         "job.created",
         {"job_id": job_id, "symbol": analyze_req.symbol, "trade_date": analyze_req.trade_date},
     )
+    if request.dry_run:
+        await _run_job(job_id, analyze_req, True, True, current_user.id, "chat")
+        status_text = _jobs.get(job_id, {}).get("status", "completed")
+        decision_text = _jobs.get(job_id, {}).get("decision", "DRY_RUN")
+        return {
+            "id": f"chatcmpl-{job_id}",
+            "object": "chat.completion",
+            "created": int(datetime.now().timestamp()),
+            "model": request.model,
+            "choices": [
+                {
+                    "index": 0,
+                    "finish_reason": "stop",
+                    "message": {
+                        "role": "assistant",
+                        "content": (
+                            f"已完成分析任务：{job_id}\n"
+                            f"symbol={analyze_req.symbol}, trade_date={analyze_req.trade_date}\n"
+                            f"status={status_text}, decision={decision_text}"
+                        ),
+                    },
+                }
+            ],
+        }
     _create_tracked_task(_run_job(job_id, analyze_req, True, True, current_user.id, "chat"))
     return {
         "id": f"chatcmpl-{job_id}",
@@ -2876,7 +3399,25 @@ def list_reports(
         skip=skip,
         limit=limit,
     )
+    code_to_name = _get_reverse_stock_map_cached_only()
+    for r in reports:
+        r.name = code_to_name.get(r.symbol, r.symbol)
+        _attach_job_runtime_state(r, str(getattr(r, "id", "")))
     return {"total": total, "reports": reports}
+
+
+@app.post("/v1/reports/latest-by-symbols", response_model=LatestReportsBySymbolsResponse)
+def list_latest_reports_by_symbols(
+    body: LatestReportsBySymbolsRequest,
+    db: Session = Depends(get_db),
+    current_user: UserDB = Depends(_require_api_user),
+):
+    reports = report_service.get_latest_reports_by_symbols(
+        db=db,
+        user_id=current_user.id,
+        symbols=body.symbols,
+    )
+    return {"reports": reports}
 
 
 @app.get("/v1/reports/{report_id}", response_model=ReportDetailResponse)
@@ -2889,6 +3430,11 @@ def get_report_endpoint(
     report = report_service.get_report(db, report_id, user_id=current_user.id)
     if not report:
         raise HTTPException(status_code=404, detail="报告不存在")
+    if str(report.status or "") in report_service.ACTIVE_REPORT_STATUSES and not _get_job(report_id):
+        report = report_service.finalize_orphan_report(db, report)
+    code_to_name = _get_reverse_stock_map()
+    report.name = code_to_name.get(report.symbol, report.symbol)
+    _attach_job_runtime_state(report, report_id)
     return report
 
 
@@ -2903,6 +3449,18 @@ def delete_report_endpoint(
     if not success:
         raise HTTPException(status_code=404, detail="报告不存在")
     return {"message": "报告已删除"}
+
+
+@app.post("/v1/reports/batch/delete", response_model=ReportBatchDeleteResponse)
+def batch_delete_reports_endpoint(
+    body: ReportBatchDeleteRequest,
+    db: Session = Depends(get_db),
+    current_user: UserDB = Depends(_require_api_user),
+):
+    try:
+        return report_service.batch_delete_reports(db, body.report_ids, user_id=current_user.id)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
 
 
 # ─── API Token Endpoints ────────────────────────────────────────────────────
@@ -3007,11 +3565,244 @@ _CONFIG_ALLOWED_KEYS = {
     "llm_provider", "deep_think_llm", "quick_think_llm",
     "backend_url", "max_debate_rounds", "max_risk_discuss_rounds",
 }
+_CONFIG_PREFERENCE_KEYS = {"email_report_enabled", "wecom_report_enabled"}
+_CONFIG_MODEL_KEYS = ("llm_provider", "backend_url", "quick_think_llm", "deep_think_llm")
+_CONFIG_MODEL_LABELS = {
+    "quick_think_llm": "常规模型",
+    "deep_think_llm": "推理模型",
+}
+_CONFIG_PROBE_TIMEOUT_SECONDS = 12.0
+_CONFIG_PROBE_PROMPT = "Reply with the single word OK."
+_CONFIG_WARMUP_TIMEOUT_SECONDS = 20.0
+_CONFIG_WARMUP_PROMPT = "Reply with the single word OK."
+
+
+def _mask_secret_value(value: Optional[str], *, head: int = 4, tail: int = 4) -> Optional[str]:
+    normalized = str(value or "").strip()
+    if not normalized:
+        return None
+    if len(normalized) <= head + tail:
+        return "*" * max(6, len(normalized))
+    return f"{normalized[:head]}{'*' * max(6, len(normalized) - head - tail)}{normalized[-tail:]}"
+
+
+def _mask_wecom_webhook(webhook_url: Optional[str]) -> Optional[str]:
+    normalized = str(webhook_url or "").strip()
+    if not normalized:
+        return None
+    prefix = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key="
+    if normalized.startswith(prefix):
+        masked_key = _mask_secret_value(normalized[len(prefix):])
+        return f"{prefix}{masked_key}"
+    if normalized.startswith("http"):
+        if "key=" in normalized:
+            base, key = normalized.rsplit("key=", 1)
+            return f"{base}key={_mask_secret_value(key)}"
+        return _mask_secret_value(normalized, head=18, tail=8)
+    return _mask_secret_value(normalized)
+
+
+def _warmup_model_names(config: Dict[str, Any]) -> List[str]:
+    seen: set[str] = set()
+    models: List[str] = []
+    for key in ("quick_think_llm", "deep_think_llm"):
+        value = str(config.get(key) or "").strip()
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        models.append(value)
+    return models
+
+
+def _warmup_model_targets(config: Dict[str, Any]) -> List[Tuple[str, List[str]]]:
+    targets: Dict[str, List[str]] = {}
+    for key in ("quick_think_llm", "deep_think_llm"):
+        model = str(config.get(key) or "").strip()
+        if not model:
+            continue
+        labels = targets.setdefault(model, [])
+        label = _CONFIG_MODEL_LABELS.get(key, key)
+        if label not in labels:
+            labels.append(label)
+    return [(model, labels) for model, labels in targets.items()]
+
+
+def _should_trigger_config_warmup(
+    before_cfg: UserRuntimeConfigResponse,
+    after_cfg: UserRuntimeConfigResponse,
+    updates: UserRuntimeConfigUpdateRequest,
+) -> bool:
+    if not updates.warmup:
+        return False
+    if updates.force_warmup:
+        return True
+    if updates.api_key:
+        return True
+    before = before_cfg.model_dump()
+    after = after_cfg.model_dump()
+    return any(before.get(key) != after.get(key) for key in _CONFIG_MODEL_KEYS)
+
+
+def _build_pending_runtime_config(
+    updates: UserRuntimeConfigUpdateRequest,
+    user_id: str,
+    db: Session,
+) -> Dict[str, Any]:
+    config = _build_runtime_config({}, user_id=user_id, db=db)
+    for key in _CONFIG_ALLOWED_KEYS:
+        value = getattr(updates, key, None)
+        if value is not None:
+            config[key] = value
+
+    if updates.clear_api_key:
+        config["api_key"] = ""
+    elif updates.api_key:
+        config["api_key"] = updates.api_key
+
+    quick = config.get("quick_think_llm")
+    deep = config.get("deep_think_llm")
+    if not deep and quick:
+        config["deep_think_llm"] = quick
+    if not quick and deep:
+        config["quick_think_llm"] = deep
+    return config
+
+
+def _should_probe_runtime_config(
+    before_cfg: UserRuntimeConfigResponse,
+    pending_cfg: Dict[str, Any],
+    updates: UserRuntimeConfigUpdateRequest,
+) -> bool:
+    del before_cfg, pending_cfg
+    if updates.clear_api_key:
+        return False
+    return bool(updates.api_key)
+
+
+def _probe_runtime_config(config: Dict[str, Any]) -> Dict[str, str]:
+    from tradingagents.llm_clients.factory import create_llm_client
+
+    provider = str(config.get("llm_provider") or "openai")
+    base_url = config.get("backend_url")
+    api_key = str(config.get("api_key") or "").strip()
+    model = str(config.get("quick_think_llm") or config.get("deep_think_llm") or "").strip()
+
+    if not model or not api_key:
+        return {"status": "skipped", "reason": "missing_model_or_key"}
+
+    try:
+        client = create_llm_client(
+            provider=provider,
+            model=model,
+            base_url=base_url,
+            api_key=api_key,
+            timeout=_CONFIG_PROBE_TIMEOUT_SECONDS,
+            max_retries=0,
+        )
+        llm = client.get_llm()
+        response = llm.invoke(_CONFIG_PROBE_PROMPT)
+        raw = response if isinstance(response, str) else getattr(response, "content", str(response))
+        preview = str(raw).strip().replace("\n", " ")[:80] or "<empty>"
+        return {"status": "ok", "model": model, "preview": preview}
+    except Exception as exc:
+        detail = str(exc).strip()
+        lowered = detail.lower()
+        if "401" in lowered or "invalid authentication" in lowered or "authenticationerror" in lowered:
+            raise HTTPException(
+                status_code=400,
+                detail="模型 Key 验证失败：上游返回 401 Invalid Authentication，请检查 API Key 是否正确。",
+            ) from exc
+        raise HTTPException(
+            status_code=400,
+            detail=f"模型连接验证失败：{detail[:200] or 'unknown error'}",
+        ) from exc
+
+
+def _invoke_runtime_warmup(
+    config: Dict[str, Any],
+    prompt: str,
+    user_id: str,
+    timeout: float = _CONFIG_WARMUP_TIMEOUT_SECONDS,
+) -> List[Dict[str, Any]]:
+    from tradingagents.llm_clients.factory import create_llm_client
+
+    provider = str(config.get("llm_provider") or "openai")
+    base_url = config.get("backend_url")
+    api_key = config.get("api_key")
+    targets = _warmup_model_targets(config)
+
+    if not targets:
+        raise HTTPException(status_code=400, detail="请先配置至少一个可用模型。")
+
+    _log(
+        f"[LLM Warmup] user={user_id} invoking provider={provider} "
+        f"models={[model for model, _ in targets]} base_url={base_url or 'default'}"
+    )
+
+    results: List[Dict[str, Any]] = []
+    errors: List[str] = []
+    for model, labels in targets:
+        try:
+            client = create_llm_client(
+                provider=provider,
+                model=model,
+                base_url=base_url,
+                api_key=api_key,
+                timeout=timeout,
+                max_retries=0,
+            )
+            llm = client.get_llm()
+            response = llm.invoke(prompt)
+            raw = response if isinstance(response, str) else getattr(response, "content", str(response))
+            content = str(raw).strip() or "<empty>"
+            preview = content.replace("\n", " ")[:80]
+            _log(f"[LLM Warmup] user={user_id} model={model} success response={preview}")
+            results.append({
+                "model": model,
+                "targets": labels,
+                "content": content,
+                "error": None,
+            })
+        except Exception as exc:
+            detail = str(exc).strip() or "unknown error"
+            errors.append(f"{model}: {detail}")
+            logger.warning(
+                "[LLM Warmup] user=%s model=%s failed: %s",
+                user_id,
+                model,
+                exc,
+            )
+            results.append({
+                "model": model,
+                "targets": labels,
+                "content": None,
+                "error": detail[:200],
+            })
+
+    if not any(item.get("content") for item in results):
+        raise HTTPException(
+            status_code=400,
+            detail=f"模型 warmup 失败：{'; '.join(errors)[:300]}",
+        )
+
+    return results
+
+
+def _run_config_warmup(config: Dict[str, Any], user_id: str) -> None:
+    models = _warmup_model_names(config)
+    if not models:
+        _log(f"[LLM Warmup] user={user_id} skipped: no models configured")
+        return
+    try:
+        _invoke_runtime_warmup(config, _CONFIG_WARMUP_PROMPT, user_id, timeout=_CONFIG_WARMUP_TIMEOUT_SECONDS)
+    except HTTPException as exc:
+        logger.warning("[LLM Warmup] user=%s failed: %s", user_id, exc.detail)
 
 
 def _config_response_for_user(user: Optional[UserDB], db: Session) -> UserRuntimeConfigResponse:
     cfg = _build_runtime_config({}, user_id=user.id if user else None, db=db)
     user_cfg = auth_service.get_user_llm_config(db, user.id) if user else None
+    webhook_url = auth_service.decrypt_secret(getattr(user_cfg, "wecom_webhook_encrypted", None))
     return UserRuntimeConfigResponse(
         llm_provider=cfg["llm_provider"],
         deep_think_llm=cfg["deep_think_llm"],
@@ -3020,16 +3811,22 @@ def _config_response_for_user(user: Optional[UserDB], db: Session) -> UserRuntim
         max_debate_rounds=cfg["max_debate_rounds"],
         max_risk_discuss_rounds=cfg["max_risk_discuss_rounds"],
         has_api_key=bool(user_cfg and user_cfg.api_key_encrypted),
+        has_wecom_webhook=bool(webhook_url),
+        wecom_webhook_display=_mask_wecom_webhook(webhook_url),
         server_fallback_enabled=bool(cfg.get("server_fallback_enabled", True)),
+        email_report_enabled=user.email_report_enabled if user and hasattr(user, 'email_report_enabled') else True,
+        wecom_report_enabled=user.wecom_report_enabled if user and hasattr(user, "wecom_report_enabled") else True,
     )
 
 
 @app.post("/v1/auth/request-code")
-def request_login_code(request: AuthRequestCodeRequest, db: Session = Depends(get_db)):
+def request_login_code(request: AuthRequestCodeRequest):
     email = auth_service.normalize_email(request.email)
-    if not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email):
+    if not re.match(r"^[^@\s]+@[^@\s.]+\.[^@\s.]+$", email):
         raise HTTPException(status_code=400, detail="邮箱格式不正确")
-    code = auth_service.upsert_login_code(db, email)
+    with get_db_ctx() as db:
+        code = auth_service.upsert_login_code(db, email)
+    # DB session 已释放，SMTP 不会阻塞连接池
     dev_code = auth_service.send_login_code(email, code)
     response = {"message": "验证码已发送"}
     if dev_code:
@@ -3063,13 +3860,31 @@ def get_runtime_config(
 @app.patch("/v1/config")
 def update_runtime_config(
     updates: UserRuntimeConfigUpdateRequest,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user: UserDB = Depends(_require_web_user),
 ):
     """更新当前用户运行时配置，下次分析时生效。"""
+    normalized_wecom_webhook = None
+    if updates.wecom_webhook_url:
+        from api.services.wecom_notification_service import normalize_webhook_url
+
+        try:
+            normalized_wecom_webhook = normalize_webhook_url(updates.wecom_webhook_url)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    persistent_user = db.query(UserDB).filter(UserDB.id == current_user.id).first() or current_user
+    before_cfg = _config_response_for_user(persistent_user, db)
+    pending_cfg = _build_pending_runtime_config(updates, persistent_user.id, db)
+    if _should_probe_runtime_config(before_cfg, pending_cfg, updates):
+        probe = _probe_runtime_config(pending_cfg)
+        _log(
+            f"[LLM Probe] user={persistent_user.id} provider={pending_cfg.get('llm_provider')} "
+            f"model={probe.get('model', '')} status={probe.get('status')}"
+        )
     row = auth_service.upsert_user_llm_config(
         db,
-        current_user.id,
+        persistent_user.id,
         llm_provider=updates.llm_provider,
         deep_think_llm=updates.deep_think_llm,
         quick_think_llm=updates.quick_think_llm,
@@ -3077,20 +3892,117 @@ def update_runtime_config(
         max_debate_rounds=updates.max_debate_rounds,
         max_risk_discuss_rounds=updates.max_risk_discuss_rounds,
         api_key=updates.api_key,
+        wecom_webhook_url=normalized_wecom_webhook,
         clear_api_key=updates.clear_api_key,
+        clear_wecom_webhook=updates.clear_wecom_webhook,
     )
+    user_pref_updated = False
+    if updates.email_report_enabled is not None:
+        persistent_user.email_report_enabled = updates.email_report_enabled
+        user_pref_updated = True
+    if updates.wecom_report_enabled is not None:
+        persistent_user.wecom_report_enabled = updates.wecom_report_enabled
+        user_pref_updated = True
+    if user_pref_updated:
+        db.commit()
+    current_cfg = _config_response_for_user(persistent_user, db)
+    warmup_models = _warmup_model_names(current_cfg.model_dump())
+    should_warmup = _should_trigger_config_warmup(before_cfg, current_cfg, updates)
+    warmup_payload: Dict[str, Any]
+    if should_warmup and warmup_models:
+        warmup_payload = {
+            "requested": True,
+            "triggered": True,
+            "status": "scheduled",
+            "models": warmup_models,
+            "message": f"模型配置已保存，后台正在预热 {len(warmup_models)} 个模型。",
+        }
+        background_tasks.add_task(
+            _run_config_warmup,
+            _build_runtime_config({}, user_id=persistent_user.id, db=db),
+            persistent_user.id,
+        )
+    elif updates.warmup:
+        warmup_payload = {
+            "requested": True,
+            "triggered": False,
+            "status": "skipped",
+            "models": warmup_models,
+            "message": "模型配置已保存，本次未触发 warmup。",
+        }
+    else:
+        warmup_payload = {
+            "requested": False,
+            "triggered": False,
+            "status": "disabled",
+            "models": [],
+            "message": "模型配置已保存。",
+        }
     filtered = {
         k: v
         for k, v in updates.model_dump().items()
         if v is not None
-        and k != "api_key"
-        and (k in _CONFIG_ALLOWED_KEYS or (k == "clear_api_key" and bool(v)))
+        and k not in {"api_key", "wecom_webhook_url", "warmup", "force_warmup"}
+        and (
+            k in _CONFIG_ALLOWED_KEYS
+            or k in _CONFIG_PREFERENCE_KEYS
+            or (k in {"clear_api_key", "clear_wecom_webhook"} and bool(v))
+        )
     }
     return {
         "message": "用户配置已更新",
         "applied": filtered,
         "has_api_key": bool(row.api_key_encrypted),
-        "current": _config_response_for_user(current_user, db),
+        "current": current_cfg,
+        "warmup": warmup_payload,
+    }
+
+
+@app.post("/v1/config/warmup", response_model=UserRuntimeWarmupResponse)
+def warmup_runtime_config(
+    request: UserRuntimeWarmupRequest,
+    db: Session = Depends(get_db),
+    current_user: UserDB = Depends(_require_web_user),
+):
+    pending_cfg = _build_pending_runtime_config(request, current_user.id, db)
+    prompt = (request.prompt or "").strip() or "你好"
+    results = _invoke_runtime_warmup(pending_cfg, prompt, current_user.id)
+    return {
+        "prompt": prompt,
+        "results": results,
+    }
+
+
+@app.post("/v1/config/wecom/warmup", response_model=WecomWebhookWarmupResponse)
+async def warmup_wecom_webhook(
+    request: WecomWebhookWarmupRequest,
+    db: Session = Depends(get_db),
+    current_user: UserDB = Depends(_require_web_user),
+):
+    from api.services.wecom_notification_service import build_test_message, normalize_webhook_url, send_message
+
+    webhook_url = (request.wecom_webhook_url or "").strip()
+    if not webhook_url:
+        user_cfg = auth_service.get_user_llm_config(db, current_user.id)
+        webhook_url = auth_service.decrypt_secret(getattr(user_cfg, "wecom_webhook_encrypted", None)) or ""
+    if not webhook_url:
+        raise HTTPException(status_code=400, detail="请先填写或保存企业微信 Webhook")
+    try:
+        webhook_url = normalize_webhook_url(webhook_url)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    try:
+        sent = await asyncio.to_thread(send_message, build_test_message(request.content), webhook_url)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Webhook 测试发送失败：{exc}") from exc
+    if not sent:
+        raise HTTPException(status_code=400, detail="Webhook 测试发送失败，请检查地址或机器人状态")
+
+    return {
+        "sent": True,
+        "message": "Webhook 测试发送成功",
+        "webhook_display": _mask_wecom_webhook(webhook_url),
     }
 
 
@@ -3127,6 +4039,122 @@ def search_stocks(
     return {"results": results}
 
 
+def _annotate_scheduled_with_imported_context(items: List[dict], db: Session, user_id: str) -> List[dict]:
+    imported_map: Dict[str, Dict[str, Any]] = {}
+    for item in portfolio_import_service.list_imported_positions(db, user_id):
+        imported_map[item["symbol"]] = item
+    for item in items:
+        imported = imported_map.get(item["symbol"])
+        item["has_imported_context"] = imported is not None
+        item["imported_current_position"] = imported.get("current_position") if imported else None
+        item["imported_average_cost"] = imported.get("average_cost") if imported else None
+        item["imported_trade_points_count"] = imported.get("trade_points_count") if imported else 0
+    return items
+
+
+def _merge_imported_user_context(*contexts: Dict[str, Any]) -> Dict[str, Any]:
+    merged: Dict[str, Any] = {}
+    note_parts: List[str] = []
+    for ctx in contexts:
+        if not ctx:
+            continue
+        for key, value in ctx.items():
+            if key == "user_notes":
+                if value:
+                    note_parts.append(str(value).strip())
+                continue
+            if value is not None:
+                merged[key] = value
+    if note_parts:
+        merged["user_notes"] = "\n\n".join(part for part in note_parts if part)
+    return normalize_user_context(merged)
+
+
+def _build_imported_user_context(db: Session, user_id: str, symbol: str) -> Dict[str, Any]:
+    context = portfolio_import_service.build_scheduled_user_context(db, user_id, symbol)
+    return _merge_imported_user_context(context)
+
+
+def _build_manual_imported_user_context(db: Session, user_id: str, symbol: str) -> Dict[str, Any]:
+    """Build imported position context for manual/ad-hoc analysis runs."""
+    return _build_imported_user_context(db, user_id, symbol)
+
+
+def _attach_stock_names(items: List[dict], code_to_name: Dict[str, str]) -> List[dict]:
+    for item in items:
+        symbol = str(item.get("symbol") or "").upper()
+        item["name"] = code_to_name.get(symbol, symbol or item.get("name") or "")
+    return items
+
+
+@app.get("/v1/portfolio/imports")
+def get_portfolio_import_state(
+    current_user: UserDB = Depends(_require_api_user),
+    db: Session = Depends(get_db),
+):
+    return portfolio_import_service.get_import_state(db, current_user.id)
+
+
+@app.post("/v1/portfolio/imports")
+def sync_portfolio_import(
+    body: PortfolioImportSyncRequest,
+    current_user: UserDB = Depends(_require_api_user),
+    db: Session = Depends(get_db),
+):
+    try:
+        return portfolio_import_service.sync_positions(
+            db=db,
+            user_id=current_user.id,
+            positions=[p.model_dump() for p in body.positions],
+            source=body.source,
+            auto_apply_scheduled=body.auto_apply_scheduled,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.delete("/v1/portfolio/imports", status_code=204)
+def clear_portfolio_import_state(
+    current_user: UserDB = Depends(_require_api_user),
+    db: Session = Depends(get_db),
+):
+    portfolio_import_service.clear_imported_portfolio(db, current_user.id)
+
+
+@app.post("/v1/portfolio/parse-image")
+async def parse_position_image_endpoint(
+    file: UploadFile = File(...),
+    current_user: UserDB = Depends(_require_api_user),
+):
+    """Parse a broker position screenshot using server-side VLM."""
+    from api.services.vlm_position_parser import parse_position_image
+
+    if not file.content_type or not file.content_type.startswith("image/"):
+        raise HTTPException(400, "只支持图片文件")
+
+    image_bytes = await file.read()
+    if len(image_bytes) > 10 * 1024 * 1024:
+        raise HTTPException(400, "图片不能超过 10MB")
+
+    try:
+        positions = await asyncio.to_thread(parse_position_image, image_bytes, file.content_type)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except Exception as exc:
+        logger.warning("[parse-image] VLM parsing failed: %s", exc)
+        raise HTTPException(500, "图片解析失败，请稍后重试") from exc
+
+    return {"positions": positions}
+
+
+@app.get("/v1/dashboard/tracking-board")
+def get_dashboard_tracking_board(
+    current_user: UserDB = Depends(_require_api_user),
+    db: Session = Depends(get_db),
+):
+    return tracking_board_service.get_tracking_board(db, current_user.id)
+
+
 # ── Watchlist ─────────────────────────────────────────────────────────────────
 
 @app.get("/v1/watchlist")
@@ -3135,30 +4163,87 @@ def list_watchlist(
     db: Session = Depends(get_db),
 ):
     items = watchlist_service.list_watchlist(db, current_user.id)
-    code_to_name = _get_reverse_stock_map()
-    for item in items:
-        item["name"] = code_to_name.get(item["symbol"], item["symbol"])
+    _attach_stock_names(items, _get_reverse_stock_map())
     return {"items": items}
 
 
-@app.post("/v1/watchlist", status_code=201)
+@app.post("/v1/watchlist")
 def add_to_watchlist(
-    body: dict,
+    body: WatchlistAddRequest,
     current_user: UserDB = Depends(_require_api_user),
     db: Session = Depends(get_db),
 ):
-    symbol = body.get("symbol", "").strip().upper()
-    if not symbol:
-        raise HTTPException(400, "symbol is required")
+    text = str(body.text or body.symbol or "").strip()
+    if not text:
+        raise HTTPException(400, "text or symbol is required")
+
+    tokens = _split_watchlist_batch_text(text)
+    if not tokens:
+        raise HTTPException(400, "至少提供一个股票代码或名称")
+
+    name_to_code = _load_cn_stock_map()
     code_to_name = _get_reverse_stock_map()
-    if symbol not in code_to_name:
-        raise HTTPException(400, f"未知的股票代码: {symbol}")
-    try:
-        item = watchlist_service.add_watchlist_item(db, current_user.id, symbol)
-        item["name"] = code_to_name.get(symbol, symbol)
-        return item
-    except ValueError as e:
-        raise HTTPException(400, str(e))
+
+    resolved_entries: List[Dict[str, Any]] = []
+    results: List[Dict[str, Any]] = []
+    for idx, token in enumerate(tokens):
+        symbol, name, error = _resolve_watchlist_identifier(token, name_to_code, code_to_name)
+        if error:
+            results.append({
+                "_order": idx,
+                "input": token,
+                "status": "invalid",
+                "message": error,
+            })
+            continue
+        resolved_entries.append({
+            "_order": idx,
+            "input": token,
+            "symbol": symbol,
+            "name": name,
+        })
+
+    add_results = watchlist_service.add_watchlist_items(
+        db,
+        current_user.id,
+        [entry["symbol"] for entry in resolved_entries],
+    )
+    for entry, result in zip(resolved_entries, add_results):
+        item = result.get("item")
+        if item:
+            item["name"] = entry["name"]
+            item["has_scheduled"] = False
+        results.append({
+            "_order": entry["_order"],
+            "input": entry["input"],
+            "symbol": entry["symbol"],
+            "name": entry["name"],
+            "status": result["status"],
+            "message": result["message"],
+            "item": item,
+        })
+
+    results.sort(key=lambda row: row["_order"])
+    for row in results:
+        row.pop("_order", None)
+    summary = {
+        "total": len(tokens),
+        "added": sum(1 for row in results if row["status"] == "added"),
+        "duplicate": sum(1 for row in results if row["status"] == "duplicate"),
+        "failed": sum(1 for row in results if row["status"] in {"invalid", "failed"}),
+    }
+    message_parts = [f"共处理 {summary['total']} 项"]
+    if summary["added"]:
+        message_parts.append(f"新增 {summary['added']} 项")
+    if summary["duplicate"]:
+        message_parts.append(f"重复 {summary['duplicate']} 项")
+    if summary["failed"]:
+        message_parts.append(f"失败 {summary['failed']} 项")
+    return {
+        "message": "，".join(message_parts),
+        "summary": summary,
+        "results": results,
+    }
 
 
 @app.delete("/v1/watchlist/{item_id}", status_code=204)
@@ -3179,10 +4264,40 @@ def list_scheduled_analyses(
     db: Session = Depends(get_db),
 ):
     items = scheduled_service.list_scheduled(db, current_user.id)
-    code_to_name = _get_reverse_stock_map()
-    for item in items:
-        item["name"] = code_to_name.get(item["symbol"], item["symbol"])
-    return {"items": items}
+    _attach_stock_names(items, _get_reverse_stock_map_cached_only())
+    return {"items": _annotate_scheduled_with_imported_context(items, db, current_user.id)}
+
+
+@app.get("/v1/portfolio/overview", response_model=PortfolioOverviewResponse)
+def get_portfolio_overview(
+    current_user: UserDB = Depends(_require_api_user),
+    db: Session = Depends(get_db),
+):
+    code_to_name = _get_reverse_stock_map_cached_only()
+
+    watchlist_items = watchlist_service.list_watchlist(db, current_user.id)
+    _attach_stock_names(watchlist_items, code_to_name)
+
+    scheduled_items = scheduled_service.list_scheduled(db, current_user.id)
+    _attach_stock_names(scheduled_items, code_to_name)
+    scheduled_items = _annotate_scheduled_with_imported_context(scheduled_items, db, current_user.id)
+
+    latest_reports = report_service.get_latest_reports_by_symbols(
+        db=db,
+        user_id=current_user.id,
+        symbols=[item["symbol"] for item in watchlist_items],
+    )
+    for report in latest_reports:
+        report.name = code_to_name.get(report.symbol, report.symbol)
+
+    portfolio_import = portfolio_import_service.get_import_state(db, current_user.id)
+
+    return {
+        "watchlist": watchlist_items,
+        "scheduled": scheduled_items,
+        "latest_reports": latest_reports,
+        "portfolio_import": portfolio_import,
+    }
 
 
 @app.post("/v1/scheduled", status_code=201)
@@ -3202,9 +4317,201 @@ def create_scheduled_analysis(
     try:
         item = scheduled_service.create_scheduled(db, current_user.id, symbol, horizon, trigger_time)
         item["name"] = code_to_name.get(symbol, symbol)
+        _annotate_scheduled_with_imported_context([item], db, current_user.id)
         return item
     except ValueError as e:
         raise HTTPException(400, str(e))
+
+
+def _extract_scheduled_update_kwargs(body: dict) -> dict:
+    kwargs = {}
+    if "is_active" in body:
+        kwargs["is_active"] = bool(body["is_active"])
+    if "horizon" in body:
+        kwargs["horizon"] = body["horizon"]
+    if "trigger_time" in body:
+        kwargs["trigger_time"] = body["trigger_time"]
+    return kwargs
+
+
+@app.patch("/v1/scheduled/batch")
+def batch_update_scheduled_analyses(
+    body: ScheduledBatchUpdateRequest,
+    current_user: UserDB = Depends(_require_api_user),
+    db: Session = Depends(get_db),
+):
+    kwargs = _extract_scheduled_update_kwargs(body.model_dump(exclude_unset=True))
+    if not kwargs:
+        raise HTTPException(400, "至少提供一个更新字段")
+    try:
+        items = scheduled_service.batch_update_scheduled(
+            db,
+            current_user.id,
+            body.item_ids,
+            **kwargs,
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    code_to_name = _get_reverse_stock_map()
+    for item in items:
+        item["name"] = code_to_name.get(item["symbol"], item["symbol"])
+    return {"items": _annotate_scheduled_with_imported_context(items, db, current_user.id)}
+
+
+@app.post("/v1/scheduled/batch/delete")
+def batch_delete_scheduled_analyses(
+    body: ScheduledBatchIdsRequest,
+    current_user: UserDB = Depends(_require_api_user),
+    db: Session = Depends(get_db),
+):
+    try:
+        return scheduled_service.batch_delete_scheduled(db, current_user.id, body.item_ids)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/v1/scheduled/batch/trigger", response_model=BatchScheduledTriggerResponse)
+async def trigger_scheduled_analyses_batch(
+    body: ScheduledBatchIdsRequest,
+    current_user: UserDB = Depends(_require_api_user),
+    db: Session = Depends(get_db),
+):
+    if not body.item_ids:
+        raise HTTPException(400, "请至少选择 1 个定时任务")
+
+    requested_trade_date = cn_today_str()
+    actual_trade_date = _resolve_scheduled_trade_date(requested_trade_date)
+    code_to_name = _get_reverse_stock_map()
+    jobs: List[Dict[str, Any]] = []
+    with_position_context = 0
+    available_tasks = {
+        task["id"]: task
+        for task in scheduled_service.list_scheduled(db, current_user.id)
+    }
+    valid_item_ids = []
+    missing_item_ids = []
+    for raw_item_id in body.item_ids:
+        item_id = str(raw_item_id or "").strip()
+        if not item_id:
+            continue
+        if item_id in available_tasks:
+            valid_item_ids.append(item_id)
+        else:
+            missing_item_ids.append(item_id)
+
+    if not valid_item_ids:
+        raise HTTPException(400, "选中的定时任务已失效，请刷新页面后重试")
+
+    if missing_item_ids:
+        _log(
+            f"[Scheduled Batch Trigger] user={current_user.id} skipped missing item_ids={missing_item_ids}"
+        )
+
+    for item_id in valid_item_ids:
+        task = available_tasks[item_id]
+
+        task_snapshot = dict(task)
+        task_snapshot["user_id"] = current_user.id
+        task_snapshot["manual_user_context"] = _build_manual_imported_user_context(db, current_user.id, task["symbol"])
+
+        scheduled_user_context = task_snapshot["manual_user_context"]
+        if scheduled_user_context.get("current_position") is not None:
+            with_position_context += 1
+
+        now = _utcnow_iso()
+        job_id = uuid4().hex
+        _set_job(
+            job_id,
+            job_id=job_id,
+            status="pending",
+            created_at=now,
+            symbol=task["symbol"],
+            trade_date=actual_trade_date,
+            user_id=current_user.id,
+            request_source="scheduled_manual_batch",
+        )
+        _ensure_job_event_queue(job_id)
+        _emit_job_event(
+            job_id,
+            "job.queued",
+            {"job_id": job_id, "symbol": task["symbol"], "trade_date": actual_trade_date},
+        )
+        _create_tracked_task(
+            _run_scheduled_analysis_once(
+                task_snapshot,
+                requested_trade_date,
+                job_id,
+                mark_schedule_run=False,
+            )
+        )
+
+        jobs.append({
+            "item_id": task["id"],
+            "job_id": job_id,
+            "symbol": task["symbol"],
+            "name": code_to_name.get(task["symbol"], task["symbol"]),
+            "status": "pending",
+            "created_at": now,
+            "current_position": scheduled_user_context.get("current_position"),
+            "average_cost": scheduled_user_context.get("average_cost"),
+            "waiting_ahead_count": _get_job(job_id).get("waiting_ahead_count"),
+            "scheduled_running_count": _get_job(job_id).get("scheduled_running_count"),
+            "scheduled_concurrency_limit": _get_job(job_id).get("scheduled_concurrency_limit"),
+        })
+
+    return {
+        "summary": {
+            "total": len(jobs),
+            "with_position_context": with_position_context,
+        },
+        "jobs": jobs,
+    }
+
+
+@app.post("/v1/scheduled/{item_id}/trigger", response_model=AnalyzeResponse)
+async def trigger_scheduled_analysis_once(
+    item_id: str,
+    current_user: UserDB = Depends(_require_api_user),
+    db: Session = Depends(get_db),
+):
+    task = scheduled_service.get_scheduled(db, current_user.id, item_id)
+    if task is None:
+        raise HTTPException(404, "未找到该定时任务")
+
+    requested_trade_date = cn_today_str()
+    actual_trade_date = _resolve_scheduled_trade_date(requested_trade_date)
+    now = _utcnow_iso()
+    job_id = uuid4().hex
+
+    task_snapshot = dict(task)
+    task_snapshot["user_id"] = current_user.id
+    task_snapshot["manual_user_context"] = _build_manual_imported_user_context(db, current_user.id, task["symbol"])
+
+    _set_job(
+        job_id,
+        job_id=job_id,
+        status="pending",
+        created_at=now,
+        symbol=task["symbol"],
+        trade_date=actual_trade_date,
+        user_id=current_user.id,
+        request_source="scheduled_manual",
+    )
+    _ensure_job_event_queue(job_id)
+    _emit_job_event(
+        job_id,
+        "job.queued",
+        {"job_id": job_id, "symbol": task["symbol"], "trade_date": actual_trade_date},
+    )
+    _create_tracked_task(
+        _run_scheduled_analysis_once(
+            task_snapshot,
+            requested_trade_date,
+            job_id,
+            mark_schedule_run=False,
+        )
+    )
+    return AnalyzeResponse(job_id=job_id, status="pending", created_at=now)
 
 
 @app.patch("/v1/scheduled/{item_id}")
@@ -3214,13 +4521,7 @@ def update_scheduled_analysis(
     current_user: UserDB = Depends(_require_api_user),
     db: Session = Depends(get_db),
 ):
-    kwargs = {}
-    if "is_active" in body:
-        kwargs["is_active"] = bool(body["is_active"])
-    if "horizon" in body:
-        kwargs["horizon"] = body["horizon"]
-    if "trigger_time" in body:
-        kwargs["trigger_time"] = body["trigger_time"]
+    kwargs = _extract_scheduled_update_kwargs(body)
     try:
         result = scheduled_service.update_scheduled(db, current_user.id, item_id, **kwargs)
     except ValueError as e:
@@ -3229,6 +4530,7 @@ def update_scheduled_analysis(
         raise HTTPException(404, "未找到该定时任务")
     code_to_name = _get_reverse_stock_map()
     result["name"] = code_to_name.get(result["symbol"], result["symbol"])
+    _annotate_scheduled_with_imported_context([result], db, current_user.id)
     return result
 
 

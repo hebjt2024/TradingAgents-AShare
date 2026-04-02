@@ -1,8 +1,9 @@
 import { FormEvent, useState, useRef, useEffect } from 'react'
 import {
-    Bot, Loader2, Send, Sparkles, Settings2, ChevronDown, ChevronUp, FileText, ChevronRight, Trash2,
+    Bot, Loader2, Send, Sparkles, FileText, ChevronRight, Trash2,
     TrendingUp, MessageCircle, Newspaper, Calculator, BarChart2, DollarSign,
-    Swords, ArrowBigUp, ArrowBigDown, Brain, Briefcase, Flame, Scale, Shield, CheckCircle2,
+    ArrowBigUp, ArrowBigDown, Brain, Briefcase, Flame, Scale, Shield, CheckCircle2,
+    Activity,
 } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
@@ -23,15 +24,6 @@ interface ChatCopilotPanelProps {
     initialInput?: string
 }
 
-const ANALYST_OPTIONS = [
-    { id: 'market', label: '市场分析', description: '技术面' },
-    { id: 'social', label: '舆情分析', description: '社交媒体' },
-    { id: 'news', label: '新闻分析', description: '财经新闻' },
-    { id: 'fundamentals', label: '基本面', description: '财务估值' },
-    { id: 'macro', label: '宏观板块', description: '宏观经济' },
-    { id: 'smart_money', label: '主力资金', description: '机构动向' },
-]
-
 interface StreamEvent {
     event: string
     data: Record<string, unknown>
@@ -50,7 +42,7 @@ const REPORT_SECTION_TITLES: Record<string, string> = {
     fundamentals_report: '基本面分析报告',
     macro_report: '宏观分析报告',
     smart_money_report: '主力资金分析报告',
-    game_theory_report: '博弈裁判报告',
+    volume_price_report: '量价分析报告',
     investment_plan: '研究团队投资计划',
     trader_investment_plan: '交易员计划',
     final_trade_decision: '最终交易决策',
@@ -64,7 +56,7 @@ const SECTION_META: Record<string, { Icon: React.FC<{ className?: string }>; ico
     fundamentals_report:    { Icon: Calculator,    iconCls: 'text-emerald-500', bgCls: 'bg-emerald-100 dark:bg-emerald-500/20' },
     macro_report:           { Icon: BarChart2,     iconCls: 'text-violet-500',  bgCls: 'bg-violet-100 dark:bg-violet-500/20' },
     smart_money_report:     { Icon: DollarSign,    iconCls: 'text-amber-500',   bgCls: 'bg-amber-100 dark:bg-amber-500/20' },
-    game_theory_report:     { Icon: Swords,        iconCls: 'text-rose-500',    bgCls: 'bg-rose-100 dark:bg-rose-500/20' },
+    volume_price_report:    { Icon: Activity,      iconCls: 'text-rose-500',    bgCls: 'bg-rose-100 dark:bg-rose-500/20' },
     investment_plan:        { Icon: Brain,         iconCls: 'text-indigo-500',  bgCls: 'bg-indigo-100 dark:bg-indigo-500/20' },
     trader_investment_plan: { Icon: Briefcase,     iconCls: 'text-orange-500',  bgCls: 'bg-orange-100 dark:bg-orange-500/20' },
     final_trade_decision:   { Icon: CheckCircle2,  iconCls: 'text-teal-500',    bgCls: 'bg-teal-100 dark:bg-teal-500/20' },
@@ -78,7 +70,7 @@ const AGENT_META_MAP: Record<string, { Icon: React.FC<{ className?: string }>; i
     'Fundamentals Analyst': { Icon: Calculator,    iconCls: 'text-emerald-500', bgCls: 'bg-emerald-100 dark:bg-emerald-500/20', label: '基本面' },
     'Macro Analyst':        { Icon: BarChart2,     iconCls: 'text-violet-500',  bgCls: 'bg-violet-100 dark:bg-violet-500/20', label: '宏观' },
     'Smart Money Analyst':  { Icon: DollarSign,    iconCls: 'text-amber-500',   bgCls: 'bg-amber-100 dark:bg-amber-500/20',  label: '主力资金' },
-    'Game Theory Manager':  { Icon: Swords,        iconCls: 'text-rose-500',    bgCls: 'bg-rose-100 dark:bg-rose-500/20',    label: '博弈裁判' },
+    'Volume Price Analyst': { Icon: Activity,      iconCls: 'text-rose-500',    bgCls: 'bg-rose-100 dark:bg-rose-500/20',    label: '量价' },
     'Bull Researcher':      { Icon: ArrowBigUp,    iconCls: 'text-emerald-500', bgCls: 'bg-emerald-100 dark:bg-emerald-500/20', label: '多头' },
     'Bear Researcher':      { Icon: ArrowBigDown,  iconCls: 'text-rose-500',    bgCls: 'bg-rose-100 dark:bg-rose-500/20',    label: '空头' },
     'Research Manager':     { Icon: Brain,         iconCls: 'text-indigo-500',  bgCls: 'bg-indigo-100 dark:bg-indigo-500/20', label: '研究总监' },
@@ -141,23 +133,23 @@ function ReportCard({
 export default function ChatCopilotPanel({ onSymbolDetected, onShowReport, initialInput }: ChatCopilotPanelProps) {
     const [input, setInput] = useState(initialInput || '')
     const [streaming, setStreaming] = useState(false)
-    const [showConfig, setShowConfig] = useState(false)
     // Tracks agent bubbles waiting for their first token (shows "正在推理分析中..." spinner)
     const pendingAgentMsgIdsRef = useRef<Set<string>>(new Set())
     // Only used to trigger re-render when pending status changes
     const [, forceUpdate] = useState(0)
     const [expandedAgentMsgId, setExpandedAgentMsgId] = useState<string | null>(null)
-    const [selectedAnalysts, setSelectedAnalysts] = useState<string[]>(() => {
+    // Use global default analysts from Settings (read-only here)
+    const selectedAnalysts = (() => {
         try {
             const stored = localStorage.getItem('tradingagents-settings')
-            if (!stored) return ['market', 'social', 'news', 'fundamentals', 'macro', 'smart_money']
+            if (!stored) return ['market', 'social', 'news', 'fundamentals', 'macro', 'smart_money', 'volume_price']
             const parsed = JSON.parse(stored) as { defaultAnalysts?: string[] }
             if (Array.isArray(parsed.defaultAnalysts) && parsed.defaultAnalysts.length > 0) {
                 return parsed.defaultAnalysts
             }
         } catch {}
-        return ['market', 'social', 'news', 'fundamentals', 'macro', 'smart_money']
-    })
+        return ['market', 'social', 'news', 'fundamentals', 'macro', 'smart_money', 'volume_price']
+    })()
     // track which section IDs have been added to chatMessages and whether they're done
     const streamingReportIds = useRef<Map<string, boolean>>(new Map()) // section → isComplete
     const agentMessageMapRef = useRef<Record<string, string>>({})
@@ -174,6 +166,7 @@ export default function ChatCopilotPanel({ onSymbolDetected, onShowReport, initi
         setCurrentSymbol,
         setIsAnalyzing,
         setIsConnected,
+        setAnalysisRunState,
         setCurrentHorizon,
         updateAgentStatus,
         updateAgentSnapshot,
@@ -186,6 +179,8 @@ export default function ChatCopilotPanel({ onSymbolDetected, onShowReport, initi
         setStructuredData,
         markAgentMessagesComplete,
         clearSession,
+        addDebateMessage,
+        appendDebateToken,
         reset,
     } = useAnalysisStore()
 
@@ -230,11 +225,13 @@ export default function ChatCopilotPanel({ onSymbolDetected, onShowReport, initi
                 pushAssistant(
                     `**分析完成（已从中断连接恢复）**\n\n方向倾向：**${String(result.result.direction || '未知')}**\n\n执行动作：**${String(result.decision || 'HOLD')}**\n\n> 免责声明：以上内容由模型基于公开数据与规则生成，仅供研究参考，不构成任何投资建议或收益承诺。`
                 )
+                setAnalysisRunState('completed')
                 return true
             }
 
             if (status.status === 'failed') {
                 pushAssistant(`分析失败：${status.error || 'unknown error'}`)
+                setAnalysisRunState('failed', status.error || 'unknown error')
                 return true
             }
 
@@ -252,12 +249,6 @@ export default function ChatCopilotPanel({ onSymbolDetected, onShowReport, initi
             behavior: 'smooth',
         })
     }, [chatMessages])
-
-    const toggleAnalyst = (id: string) => {
-        setSelectedAnalysts((prev) =>
-            prev.includes(id) ? prev.filter((a) => a !== id) : [...prev, id]
-        )
-    }
 
     const pushAssistant = (content: string) => {
         addChatMessage({
@@ -308,6 +299,7 @@ export default function ChatCopilotPanel({ onSymbolDetected, onShowReport, initi
             }
             case 'job.running':
                 setIsAnalyzing(true)
+                setAnalysisRunState('running')
                 // 切换 indicator 到"分析启动"阶段
                 if (typingIndicatorIdRef.current) {
                     setMessageContent(typingIndicatorIdRef.current, '__status:analyzing__')
@@ -324,6 +316,7 @@ export default function ChatCopilotPanel({ onSymbolDetected, onShowReport, initi
             case 'job.completed': {
                 setCurrentHorizon(null)
                 setIsAnalyzing(false)
+                setAnalysisRunState('completed')
                 // 任务结束：所有 agent 消息标记为已完成（持久化到 store）
                 pendingAgentMsgIdsRef.current = new Set()
                 forceUpdate(n => n + 1)
@@ -357,6 +350,7 @@ export default function ChatCopilotPanel({ onSymbolDetected, onShowReport, initi
             case 'job.failed':
                 setCurrentHorizon(null)
                 setIsAnalyzing(false)
+                setAnalysisRunState('failed', String(data.error || 'unknown error'))
                 pushAssistant(`分析失败：${String(data.error || 'unknown error')}`)
                 break
             case 'agent.status': {
@@ -507,6 +501,47 @@ export default function ChatCopilotPanel({ onSymbolDetected, onShowReport, initi
                 }
                 break
             }
+            case 'agent.debate.token': {
+                const raw = data as Record<string, unknown>
+                const debate = raw.debate
+                const token = raw.token
+                if (
+                    (debate !== 'research' && debate !== 'risk') ||
+                    typeof raw.agent !== 'string' ||
+                    typeof raw.round !== 'number' ||
+                    typeof token !== 'string'
+                ) break
+                appendDebateToken(
+                    debate, raw.agent, raw.round, token,
+                    typeof raw.horizon === 'string' ? raw.horizon : undefined,
+                )
+                break
+            }
+            case 'agent.debate': {
+                const raw = data as Record<string, unknown>
+                const debate = raw.debate
+                const agent = raw.agent
+                const round = raw.round
+                const content = raw.content
+                if (
+                    (debate !== 'research' && debate !== 'risk') ||
+                    typeof agent !== 'string' ||
+                    typeof round !== 'number' ||
+                    typeof content !== 'string'
+                ) {
+                    console.warn('[SSE] Malformed agent.debate payload, skipping:', raw)
+                    break
+                }
+                addDebateMessage({
+                    debate,
+                    agent,
+                    round,
+                    content,
+                    isVerdict: raw.is_verdict === true,
+                    horizon: typeof raw.horizon === 'string' ? raw.horizon : undefined,
+                })
+                break
+            }
             default:
                 break
         }
@@ -602,6 +637,7 @@ export default function ChatCopilotPanel({ onSymbolDetected, onShowReport, initi
         setStreaming(true)
         setIsAnalyzing(true)
         setIsConnected(false)
+        setAnalysisRunState('running')
 
         try {
             await streamChat(fullPrompt)
@@ -618,9 +654,11 @@ export default function ChatCopilotPanel({ onSymbolDetected, onShowReport, initi
             if (shouldRecover) {
                 const recovered = await recoverInterruptedJob()
                 if (!recovered) {
+                    setAnalysisRunState('failed', errorMessage)
                     pushAssistant(`请求中断：${errorMessage}\n\n后端任务可能仍在执行，请稍后到历史报告中查看结果。`)
                 }
             } else {
+                setAnalysisRunState('failed', errorMessage)
                 pushAssistant(`请求失败：${errorMessage}`)
             }
             setIsAnalyzing(false)
@@ -686,42 +724,6 @@ export default function ChatCopilotPanel({ onSymbolDetected, onShowReport, initi
                         {prompt}
                     </button>
                 ))}
-            </div>
-
-            {/* 分析师配置（可折叠） */}
-            <div className="mb-3 border border-slate-200 dark:border-slate-700 rounded-lg overflow-hidden">
-                <button
-                    onClick={() => setShowConfig(!showConfig)}
-                    className="w-full flex items-center justify-between px-3 py-2 bg-slate-50 dark:bg-slate-800/50 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors"
-                >
-                    <div className="flex items-center gap-2">
-                        <Settings2 className="w-4 h-4 text-slate-400" />
-                        <span className="text-sm text-slate-600 dark:text-slate-400">
-                            分析类型 ({selectedAnalysts.length}/6)
-                        </span>
-                    </div>
-                    {showConfig ? <ChevronUp className="w-4 h-4 text-slate-400" /> : <ChevronDown className="w-4 h-4 text-slate-400" />}
-                </button>
-
-                {showConfig && (
-                    <div className="p-3 bg-white dark:bg-slate-800/30">
-                        <div className="flex flex-wrap gap-2">
-                            {ANALYST_OPTIONS.map((option) => (
-                                <button
-                                    key={option.id}
-                                    onClick={() => toggleAnalyst(option.id)}
-                                    className={`px-3 py-1.5 text-xs rounded-md border transition-all ${selectedAnalysts.includes(option.id)
-                                        ? 'bg-blue-50 dark:bg-blue-500/10 border-blue-500 text-blue-600 dark:text-blue-400'
-                                        : 'bg-slate-100 dark:bg-slate-800 border-slate-200 dark:border-slate-700 text-slate-500 dark:text-slate-500'
-                                        }`}
-                                >
-                                    <span className="font-medium">{option.label}</span>
-                                    <span className="block opacity-70">{option.description}</span>
-                                </button>
-                            ))}
-                        </div>
-                    </div>
-                )}
             </div>
 
             {/* 聊天内容 */}

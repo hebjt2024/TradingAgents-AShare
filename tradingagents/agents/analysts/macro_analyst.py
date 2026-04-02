@@ -4,19 +4,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from tradingagents.dataflows.config import get_config
 from tradingagents.prompts import get_prompt
 from tradingagents.graph.intent_parser import build_horizon_context
-from tradingagents.agents.utils.agent_states import current_tracker_var
-
-
-def _extract_verdict(text):
-    import re, json
-    m = re.search(r'<!--\s*VERDICT:\s*(\{.*?\})\s*-->', text, re.DOTALL)
-    if m:
-        try:
-            d = json.loads(m.group(1))
-            return d.get("direction", "中性"), "中"
-        except Exception:
-            pass
-    return "中性", "低"
+from tradingagents.agents.utils.agent_states import current_tracker_var, extract_verdict
 
 
 def create_macro_analyst(llm, data_collector=None):
@@ -30,7 +18,7 @@ def create_macro_analyst(llm, data_collector=None):
         current_date = state["trade_date"]
         ticker = state["company_of_interest"]
         print(f"[Macro Analyst] START {ticker} {current_date}")
-        horizon = state.get("horizon", "medium")
+        horizon = "medium"  # 宏观面固定中长期视角
         user_intent = state.get("user_intent") or {}
         focus_areas = user_intent.get("focus_areas", [])
         specific_questions = user_intent.get("specific_questions", [])
@@ -62,10 +50,11 @@ def create_macro_analyst(llm, data_collector=None):
 
         messages = [
             SystemMessage(content=(
-                horizon_ctx + system_message
+                system_message
                 + "\n\n请严格基于提供的数据输出报告，全程使用中文。"
             )),
             HumanMessage(content=(
+                horizon_ctx + "\n"
                 f"请分析 {ticker} 在 {current_date} 的宏观与板块环境。\n\n"
                 f"【今日行业板块资金流向】\n{board_flow}\n\n"
                 f"【近期相关新闻】\n{recent_news}"
@@ -82,7 +71,7 @@ def create_macro_analyst(llm, data_collector=None):
                 tracker._emit_token("Macro Analyst", "macro_report", content)
 
         print(f"[Macro Analyst] DONE {ticker}, report length={len(full_content)}")
-        verdict, confidence = _extract_verdict(full_content)
+        verdict, confidence = extract_verdict(full_content)
         return {
             "macro_report": full_content,
             "analyst_traces": [{

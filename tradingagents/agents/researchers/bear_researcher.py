@@ -21,6 +21,7 @@ def create_bear_researcher(llm, memory):
         sentiment_report = state["sentiment_report"]
         news_report = state["news_report"]
         fundamentals_report = state["fundamentals_report"]
+        volume_price_report = state.get("volume_price_report", "")
         claims = investment_debate_state.get("claims", [])
         focus_claim_ids = investment_debate_state.get("focus_claim_ids", [])
         unresolved_claim_ids = investment_debate_state.get("unresolved_claim_ids", [])
@@ -33,7 +34,7 @@ def create_bear_researcher(llm, memory):
         specific_questions = user_intent.get("specific_questions", [])
         horizon_ctx = build_horizon_context(horizon, focus_areas, specific_questions, agent_type="bear")
 
-        curr_situation = f"{market_research_report}\n\n{sentiment_report}\n\n{news_report}\n\n{fundamentals_report}"
+        curr_situation = f"{market_research_report}\n\n{sentiment_report}\n\n{news_report}\n\n{fundamentals_report}\n\n{volume_price_report}"
         past_memories = memory.get_memories(curr_situation, n_matches=2)
 
         past_memory_str = ""
@@ -45,6 +46,7 @@ def create_bear_researcher(llm, memory):
             sentiment_report=sentiment_report,
             news_report=news_report,
             fundamentals_report=fundamentals_report,
+            volume_price_report=volume_price_report,
             history=history,
             current_response=current_response,
             past_memory_str=past_memory_str,
@@ -57,12 +59,27 @@ def create_bear_researcher(llm, memory):
 
         # ── 实现 Token 级流式输出 ──────────────────
         tracker = current_tracker_var.get()
+        try:
+            debate_round = int(investment_debate_state.get("count", 0) or 0) // 2 + 1
+        except (ValueError, TypeError):
+            debate_round = 1
         full_content = ""
         async for chunk in llm.astream(prompt):
             content = chunk.content if hasattr(chunk, "content") else str(chunk)
             full_content += content
             if tracker:
                 tracker._emit_token("Bear Researcher", "investment_debate_state", content)
+                tracker.emit_debate_token(
+                    debate="research", agent="Bear Researcher",
+                    round_num=debate_round, token=content,
+                )
+
+        # ── 推送辩论完整消息（标记流式结束）──
+        if tracker:
+            tracker.emit_debate_message(
+                debate="research", agent="Bear Researcher",
+                round_num=debate_round, content=full_content,
+            )
 
         new_investment_debate_state = update_debate_state_with_payload(
             state=investment_debate_state,

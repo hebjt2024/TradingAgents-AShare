@@ -1,4 +1,4 @@
-import type { AnalysisRequest, AnalysisResponse, Announcement, AuthUser, AuthVerifyResponse, JobStatus, AnalysisReport, KlineResponse, LatestAnnouncementResponse, Report, ReportDetail, ReportListResponse, RuntimeConfig, RuntimeConfigUpdate, RuntimeConfigUpdateResponse, WatchlistItem, ScheduledAnalysis, StockSearchResult, UserToken, UserTokenCreateRequest } from '@/types'
+import type { AnalysisRequest, AnalysisResponse, Announcement, AuthUser, AuthVerifyResponse, JobStatus, AnalysisReport, KlineResponse, LatestAnnouncementResponse, PortfolioImportState, PortfolioOverviewResponse, PortfolioPositionInput, Report, ReportDetail, ReportListResponse, RuntimeConfig, RuntimeConfigUpdate, RuntimeConfigUpdateResponse, RuntimeWarmupRequest, RuntimeWarmupResponse, WatchlistItem, WatchlistBatchResponse, ScheduledAnalysis, ScheduledBatchTriggerResponse, StockSearchResult, TrackingBoardResponse, UserToken, UserTokenCreateRequest, WecomWarmupRequest, WecomWarmupResponse } from '@/types'
 
 export function getBaseUrl(): string {
     const envUrl = (import.meta.env.VITE_API_URL as string) || ''
@@ -44,7 +44,22 @@ class ApiService {
             throw new Error(error || `HTTP error! status: ${response.status}`)
         }
 
-        return response.json()
+        if (response.status === 204 || response.status === 205) {
+            return undefined as T
+        }
+
+        const contentType = response.headers.get('content-type') || ''
+        if (!contentType.includes('application/json')) {
+            const text = await response.text()
+            return (text ? (text as T) : undefined) as T
+        }
+
+        const raw = await response.text()
+        if (!raw) {
+            return undefined as T
+        }
+
+        return JSON.parse(raw) as T
     }
 
     async startAnalysis(request: AnalysisRequest): Promise<AnalysisResponse> {
@@ -103,6 +118,13 @@ class ApiService {
         return this.request<ReportListResponse>(`/v1/reports?${params}`)
     }
 
+    async getLatestReportsBySymbols(symbols: string[]): Promise<{ reports: Report[] }> {
+        return this.request<{ reports: Report[] }>('/v1/reports/latest-by-symbols', {
+            method: 'POST',
+            body: JSON.stringify({ symbols }),
+        })
+    }
+
     async getReport(reportId: string): Promise<ReportDetail> {
         return this.request<ReportDetail>(`/v1/reports/${reportId}`)
     }
@@ -117,6 +139,7 @@ class ApiService {
             method: 'DELETE',
         })
     }
+
 
     async createReport(report: {
         symbol: string
@@ -134,10 +157,10 @@ class ApiService {
     async getWatchlist(): Promise<{ items: WatchlistItem[] }> {
         return this.request<{ items: WatchlistItem[] }>('/v1/watchlist')
     }
-    async addToWatchlist(symbol: string): Promise<WatchlistItem> {
-        return this.request<WatchlistItem>('/v1/watchlist', {
+    async addToWatchlist(input: string): Promise<WatchlistBatchResponse> {
+        return this.request<WatchlistBatchResponse>('/v1/watchlist', {
             method: 'POST',
-            body: JSON.stringify({ symbol }),
+            body: JSON.stringify({ text: input }),
         })
     }
     async removeFromWatchlist(id: string): Promise<void> {
@@ -147,6 +170,9 @@ class ApiService {
     // Scheduled Analysis
     async getScheduled(): Promise<{ items: ScheduledAnalysis[] }> {
         return this.request<{ items: ScheduledAnalysis[] }>('/v1/scheduled')
+    }
+    async getPortfolioOverview(): Promise<PortfolioOverviewResponse> {
+        return this.request<PortfolioOverviewResponse>('/v1/portfolio/overview')
     }
     async createScheduled(symbol: string, horizon?: string, trigger_time?: string): Promise<ScheduledAnalysis> {
         return this.request<ScheduledAnalysis>('/v1/scheduled', {
@@ -160,8 +186,76 @@ class ApiService {
             body: JSON.stringify(data),
         })
     }
+    async updateScheduledBatch(
+        item_ids: string[],
+        data: { is_active?: boolean; horizon?: string; trigger_time?: string }
+    ): Promise<{ items: ScheduledAnalysis[] }> {
+        return this.request<{ items: ScheduledAnalysis[] }>('/v1/scheduled/batch', {
+            method: 'PATCH',
+            body: JSON.stringify({ item_ids, ...data }),
+        })
+    }
     async deleteScheduled(id: string): Promise<void> {
         await this.request('/v1/scheduled/' + id, { method: 'DELETE' })
+    }
+    async deleteScheduledBatch(item_ids: string[]): Promise<{ deleted_ids: string[]; missing_ids: string[] }> {
+        return this.request<{ deleted_ids: string[]; missing_ids: string[] }>('/v1/scheduled/batch/delete', {
+            method: 'POST',
+            body: JSON.stringify({ item_ids }),
+        })
+    }
+    async triggerScheduledTest(id: string): Promise<AnalysisResponse> {
+        return this.request<AnalysisResponse>(`/v1/scheduled/${id}/trigger`, {
+            method: 'POST',
+        })
+    }
+    async triggerScheduledBatch(item_ids: string[]): Promise<ScheduledBatchTriggerResponse> {
+        return this.request<ScheduledBatchTriggerResponse>('/v1/scheduled/batch/trigger', {
+            method: 'POST',
+            body: JSON.stringify({ item_ids }),
+        })
+    }
+
+    async getPortfolioImportState(): Promise<PortfolioImportState> {
+        return this.request<PortfolioImportState>('/v1/portfolio/imports')
+    }
+
+    async syncPortfolioImport(data: {
+        positions: PortfolioPositionInput[]
+        source?: string
+        auto_apply_scheduled: boolean
+    }): Promise<PortfolioImportState> {
+        return this.request<PortfolioImportState>('/v1/portfolio/imports', {
+            method: 'POST',
+            body: JSON.stringify(data),
+        })
+    }
+
+    async clearPortfolioImport(): Promise<void> {
+        await this.request('/v1/portfolio/imports', { method: 'DELETE' })
+    }
+
+    async parsePositionImage(file: File): Promise<{ positions: PortfolioPositionInput[] }> {
+        const formData = new FormData()
+        formData.append('file', file)
+        const url = `${getBaseUrl()}/v1/portfolio/parse-image`
+        const token = getAuthToken()
+        const response = await fetch(url, {
+            method: 'POST',
+            headers: {
+                ...(token ? { Authorization: `Bearer ${token}` } : {}),
+            },
+            body: formData,
+        })
+        if (!response.ok) {
+            const error = await response.json().catch(() => ({ detail: response.statusText }))
+            throw new Error(error.detail || '图片解析失败')
+        }
+        return response.json()
+    }
+
+    async getDashboardTrackingBoard(): Promise<TrackingBoardResponse> {
+        return this.request<TrackingBoardResponse>('/v1/dashboard/tracking-board')
     }
 
     // Stock Search
@@ -177,6 +271,20 @@ class ApiService {
         return this.request<RuntimeConfigUpdateResponse>('/v1/config', {
             method: 'PATCH',
             body: JSON.stringify(updates),
+        })
+    }
+
+    async warmupConfig(request: RuntimeWarmupRequest): Promise<RuntimeWarmupResponse> {
+        return this.request<RuntimeWarmupResponse>('/v1/config/warmup', {
+            method: 'POST',
+            body: JSON.stringify(request),
+        })
+    }
+
+    async warmupWecom(request: WecomWarmupRequest): Promise<WecomWarmupResponse> {
+        return this.request<WecomWarmupResponse>('/v1/config/wecom/warmup', {
+            method: 'POST',
+            body: JSON.stringify(request),
         })
     }
 
